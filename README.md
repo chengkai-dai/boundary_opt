@@ -127,7 +127,7 @@ uv run python generate_tutorial_figures.py
 
 | 文件 | 用途 |
 |---|---|
-| <code>boundary_opt.py</code> | 网格、边界参数化、P1/FEM、Schur、loss、伴随梯度、L-BFGS |
+| <code>boundary_opt.py</code> | 网格、边界参数化、P1/FEM、Schur、harmonic lift、loss、伴随梯度、L-BFGS |
 | <code>scan_mesh_seeds.py</code> | 对任意支持的 mesh 扫描随机 seed |
 | <code>plot_loss_curves.py</code> | 从 history CSV 生成 SVG loss 图 |
 | <code>visualize_mesh_optimization.py</code> | Polyscope 静态前后对比与优化动画 |
