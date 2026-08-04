@@ -1,28 +1,21 @@
-"""Differentiable four-endpoint harmonic boundary optimization.
+"""Differentiable four-parameter boundary optimization on triangle meshes.
 
-Four ordered endpoints define two arcs on one boundary loop.  The first
-arc targets field value zero and the second targets one; the rest of the
-boundary has the natural Neumann condition.  Moving arcs are represented by
-exact P1 boundary-mass integrals, whose endpoint derivatives remain continuous
-as an endpoint crosses a mesh vertex.  A precomputed interior Schur reduction,
-one boundary solve, one harmonic lift, and one adjoint backsolve provide the
-exact gradient.  The latent Robin solution is affinely calibrated so the two
-target-arc means of the public field are exactly zero and one.  Direct gap
-variables and a linear simplex constraint keep the four endpoints ordered.
+The four design variables produce four ordered cyclic knots.  They define a
+C2 boundary profile with a zero plateau, a smooth rise, a one plateau, and a
+smooth fall.  The interior is the cotangent-harmonic extension of that fixed
+boundary data.  Gradients use one exact adjoint backsolve; no knitting code,
+autodiff framework, moving vertex set, or contour extraction is involved.
 """
 
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import scipy.linalg
 import scipy.optimize
 import scipy.sparse
-import scipy.sparse.csgraph
 import scipy.sparse.linalg
 from numpy.typing import NDArray
 
@@ -36,50 +29,28 @@ class Mesh:
     faces: IntArray
 
     def __post_init__(self) -> None:
-        vertices = np.asarray(self.vertices)
-        faces = np.asarray(self.faces)
-        if vertices.ndim != 2 or vertices.shape[1] != 3:
+        if self.vertices.ndim != 2 or self.vertices.shape[1] != 3:
             raise ValueError("vertices must have shape (V, 3)")
-        if faces.ndim != 2 or faces.shape[1] != 3:
+        if self.faces.ndim != 2 or self.faces.shape[1] != 3:
             raise ValueError("faces must have shape (F, 3)")
-        if not np.issubdtype(faces.dtype, np.integer):
-            raise TypeError("faces must contain integer vertex indices")
-
-        vertices = np.array(vertices, dtype=np.float64, order="C", copy=True)
-        faces = np.array(faces, dtype=np.int64, order="C", copy=True)
-        if not np.isfinite(vertices).all():
+        if not np.isfinite(self.vertices).all():
             raise ValueError("vertices contain NaN or infinite values")
-        if len(vertices) == 0 or len(faces) == 0:
+        if len(self.vertices) == 0 or len(self.faces) == 0:
             raise ValueError("mesh must contain vertices and faces")
-        if faces.min() < 0 or faces.max() >= len(vertices):
+        if self.faces.min() < 0 or self.faces.max() >= len(self.vertices):
             raise ValueError("faces reference a vertex outside the mesh")
-        vertices.setflags(write=False)
-        faces.setflags(write=False)
-        object.__setattr__(self, "vertices", vertices)
-        object.__setattr__(self, "faces", faces)
 
 
 @dataclass(frozen=True, slots=True)
 class FieldStatistics:
-    gradient_cv: float
     spacing_cv: float
     minimum_gradient: float
     maximum_gradient: float
 
 
 @dataclass(frozen=True, slots=True)
-class BoundaryStatistics:
-    raw_zero_mean: float
-    raw_one_mean: float
-    raw_span: float
-    raw_zero_target_rms: float
-    raw_one_target_rms: float
-    canonical_zero_target_rms: float
-    canonical_one_target_rms: float
-
-
-@dataclass(frozen=True, slots=True)
 class OptimizationResult:
+    seed: int | None
     initial_loss: float
     final_loss: float
     uniformity_loss: float
@@ -89,15 +60,11 @@ class OptimizationResult:
     parameters: FloatArray
     knots: FloatArray
     gaps: FloatArray
-    raw_field: FloatArray
     field: FloatArray
     statistics: FieldStatistics
-    boundary_statistics: BoundaryStatistics
     iterations: int
     evaluations: int
-    constraint_violation: float
-    kkt_residual: float
-    minimum_projected_hessian_eigenvalue: float
+    gradient_norm: float
     success: bool
     message: str
 
@@ -121,8 +88,6 @@ def load_obj(path: str | Path) -> Mesh:
             polygon: list[int] = []
             for token in fields[1:]:
                 raw = int(token.split("/", 1)[0])
-                if raw == 0:
-                    raise ValueError(f"OBJ vertex indices are one-based in {source}")
                 index = raw - 1 if raw > 0 else len(vertices) + raw
                 polygon.append(index)
             faces.extend(
@@ -159,7 +124,6 @@ def boundary_loop(faces: IntArray) -> IntArray:
 
     start = min(adjacency)
     loop = [start]
-    visited = {start}
     previous = -1
     current = start
     while True:
@@ -167,10 +131,9 @@ def boundary_loop(faces: IntArray) -> IntArray:
         following = first if first != previous else second
         if following == start:
             break
-        if following in visited:
+        if following in loop:
             raise ValueError("boundary contains a repeated vertex before closing")
         loop.append(following)
-        visited.add(following)
         previous, current = current, following
     if len(loop) != len(adjacency):
         raise ValueError("optimizer requires exactly one boundary loop")
@@ -187,179 +150,103 @@ def boundary_arclength(vertices: FloatArray, loop: IntArray) -> FloatArray:
     return np.concatenate(([0.0], np.cumsum(lengths[:-1]))) / perimeter
 
 
-def _validated_knots(knots: FloatArray) -> FloatArray:
+def _smoothstep5(values: FloatArray) -> FloatArray:
+    """Quintic smoothstep on [0, 1], with zero first/second endpoint slopes."""
+    return values**3 * (values * (values * 6.0 - 15.0) + 10.0)
+
+
+def _smoothstep5_derivative(values: FloatArray) -> FloatArray:
+    return 30.0 * values**2 * (values - 1.0) ** 2
+
+
+def cyclic_boundary_profile(
+    positions: FloatArray, knots: FloatArray
+) -> tuple[FloatArray, FloatArray]:
+    """Evaluate the cyclic 0/smooth-rise/1/smooth-fall profile and Jacobian.
+
+    ``knots`` are unwrapped and must satisfy ``k0 < k1 < k2 < k3 < k0 + 1``.
+    The returned Jacobian has shape ``(len(positions), 4)``.
+    """
+    positions = np.asarray(positions, dtype=np.float64).reshape(-1)
     knots = np.asarray(knots, dtype=np.float64).reshape(-1)
     if knots.shape != (4,) or not np.isfinite(knots).all():
         raise ValueError("knots must contain four finite values")
+    if not np.isfinite(positions).all():
+        raise ValueError("positions contain NaN or infinite values")
     if np.any(np.diff(knots) <= 0.0) or knots[3] >= knots[0] + 1.0:
         raise ValueError("knots must satisfy k0 < k1 < k2 < k3 < k0 + 1")
-    return knots
 
+    local = np.mod(positions - knots[0], 1.0)
+    first, second, third = knots[1:] - knots[0]
+    values = np.zeros_like(local)
+    jacobian = np.zeros((len(local), 4), dtype=np.float64)
 
-def _validated_minimum_gap(minimum_gap: float) -> float:
-    if not np.isfinite(minimum_gap) or not 0.0 < minimum_gap < 0.25:
-        raise ValueError("minimum_gap must lie in (0, 0.25)")
-    return float(minimum_gap)
+    rising = (local > first) & (local < second)
+    rise_width = knots[2] - knots[1]
+    z = (local[rising] - first) / rise_width
+    values[rising] = _smoothstep5(z)
+    slope = _smoothstep5_derivative(z) / rise_width
+    jacobian[rising, 1] = -slope * (1.0 - z)
+    jacobian[rising, 2] = -slope * z
 
+    values[(local >= second) & (local <= third)] = 1.0
 
-def _validated_boundary_positions(positions: FloatArray) -> FloatArray:
-    positions = np.asarray(positions, dtype=np.float64).reshape(-1)
-    if len(positions) < 3 or not np.isfinite(positions).all():
-        raise ValueError("positions must contain at least three finite values")
-    if abs(float(positions[0])) > 1.0e-12:
-        raise ValueError("the first boundary position must be zero")
-    if np.any(np.diff(positions) <= 0.0) or positions[-1] >= 1.0:
-        raise ValueError("boundary positions must increase within [0, 1)")
-    return positions
-
-
-def _arc_edge_coordinates(
-    positions: FloatArray,
-    edge_lengths: FloatArray,
-    start: float,
-    end: float,
-) -> tuple[FloatArray, FloatArray, FloatArray]:
-    """Return local coordinates of one cyclic arc on every boundary edge."""
-    origin = start % 1.0
-    stop = origin + end - start
-    local_start = np.clip((origin - positions) / edge_lengths, 0.0, 1.0)
-    local_end = np.clip((min(stop, 1.0) - positions) / edge_lengths, 0.0, 1.0)
-    wrapped_end = np.clip((max(stop - 1.0, 0.0) - positions) / edge_lengths, 0.0, 1.0)
-    return local_start, local_end, wrapped_end
-
-
-def cyclic_arc_edge_weights(
-    positions: FloatArray, knots: FloatArray
-) -> tuple[FloatArray, FloatArray]:
-    """Return exact fractional coverage of each boundary edge by both arcs.
-
-    The first array describes the zero-target arc ``[k0, k1]`` and the second
-    the one-target arc ``[k2, k3]``.  These weights are primarily intended for
-    visualization; the PDE uses exact consistent edge-mass integration.
-    """
-    positions = _validated_boundary_positions(positions)
-    knots = _validated_knots(knots)
-    edge_lengths = np.diff(np.append(positions, 1.0))
-    weights = []
-    for start, end in ((knots[0], knots[1]), (knots[2], knots[3])):
-        local_start, local_end, wrapped_end = _arc_edge_coordinates(
-            positions, edge_lengths, float(start), float(end)
-        )
-        weights.append(np.clip(local_end - local_start + wrapped_end, 0.0, 1.0))
-    return weights[0], weights[1]
+    falling = local > third
+    fall_width = knots[0] + 1.0 - knots[3]
+    z = (local[falling] - third) / fall_width
+    values[falling] = 1.0 - _smoothstep5(z)
+    slope = _smoothstep5_derivative(z) / fall_width
+    jacobian[falling, 0] = slope * z
+    jacobian[falling, 3] = slope * (1.0 - z)
+    return values, jacobian
 
 
 def knots_from_parameters(
-    parameters: FloatArray,
+    parameters: FloatArray, minimum_gap: float
 ) -> tuple[FloatArray, FloatArray, FloatArray]:
-    """Map one origin and four positive gap coordinates to four knots.
-
-    SLSQP may evaluate away from the sum-to-one constraint, so the gaps are
-    normalized here.  On the feasible simplex this is exactly the identity.
-    """
+    """Map one origin and three gauge-fixed logits to four ordered knots."""
     parameters = np.asarray(parameters, dtype=np.float64).reshape(-1)
-    if parameters.shape != (5,) or not np.isfinite(parameters).all():
-        raise ValueError("parameters must contain one origin and four finite gaps")
-    raw_gaps = parameters[1:]
-    if np.any(raw_gaps <= 0.0):
-        raise ValueError("direct cyclic gaps must be positive")
-    total = float(raw_gaps.sum())
-    gaps = raw_gaps / total
+    if parameters.shape != (4,) or not np.isfinite(parameters).all():
+        raise ValueError("parameters must contain four finite values")
+    if not np.isfinite(minimum_gap) or not 0.0 <= minimum_gap < 0.25:
+        raise ValueError("minimum_gap must lie in [0, 0.25)")
+
+    logits = np.concatenate((parameters[1:], [0.0]))
+    exponentials = np.exp(logits - logits.max())
+    probabilities = exponentials / exponentials.sum()
+    scale = 1.0 - 4.0 * minimum_gap
+    gaps = minimum_gap + scale * probabilities
     knots = parameters[0] + np.concatenate(([0.0], np.cumsum(gaps[:3])))
-    normalization_jacobian = (
-        np.eye(4, dtype=np.float64) * total - np.outer(raw_gaps, np.ones(4))
-    ) / total**2
-    cumulative_jacobian = np.tril(np.ones((4, 4), dtype=np.float64), k=-1)
-    jacobian = np.empty((4, 5), dtype=np.float64)
+
+    softmax_jacobian = np.diag(probabilities) - np.outer(probabilities, probabilities)
+    gap_jacobian = scale * softmax_jacobian[:, :3]
+    jacobian = np.zeros((4, 4), dtype=np.float64)
     jacobian[:, 0] = 1.0
-    jacobian[:, 1:] = cumulative_jacobian @ normalization_jacobian
+    for index in range(1, 4):
+        jacobian[index, 1:] = gap_jacobian[:index].sum(axis=0)
     return knots, jacobian, gaps
 
 
-def parameters_from_knots(knots: FloatArray) -> FloatArray:
-    """Return one origin and all four direct cyclic gaps."""
-    knots = _validated_knots(knots)
+def parameters_from_knots(knots: FloatArray, minimum_gap: float) -> FloatArray:
+    """Invert :func:`knots_from_parameters` after fixing the softmax gauge."""
+    knots = np.asarray(knots, dtype=np.float64).reshape(-1)
+    if knots.shape != (4,) or not np.isfinite(knots).all():
+        raise ValueError("knots must contain four finite values")
+    if not np.isfinite(minimum_gap) or not 0.0 <= minimum_gap < 0.25:
+        raise ValueError("minimum_gap must lie in [0, 0.25)")
     gaps = np.append(np.diff(knots), knots[0] + 1.0 - knots[3])
-    return np.concatenate(([knots[0]], gaps))
-
-
-def _gap_kkt_residual(
-    gradient: FloatArray, gaps: FloatArray, minimum_gap: float
-) -> float:
-    """Return the infinity-norm KKT residual on the cyclic gap simplex."""
-    gradient = np.asarray(gradient, dtype=np.float64)
-    gaps = np.asarray(gaps, dtype=np.float64)
-    gap_gradient = gradient[1:]
-    tolerance = (
-        64.0
-        * np.finfo(np.float64).eps
-        * max(1.0, abs(minimum_gap), float(np.abs(gaps).max()))
-    )
-    active = gaps <= minimum_gap + tolerance
-    free = ~active
-    if not np.any(free):
-        return np.inf
-    multiplier = float(gap_gradient[free].mean())
-    residuals = [abs(float(gradient[0]))]
-    residuals.extend(np.abs(gap_gradient[free] - multiplier))
-    residuals.extend(np.maximum(multiplier - gap_gradient[active], 0.0))
-    return float(max(residuals))
-
-
-def _minimum_projected_hessian_eigenvalue(
-    gradient_function: Callable[[FloatArray], FloatArray],
-    parameters: FloatArray,
-    gradient: FloatArray,
-    minimum_gap: float,
-) -> float:
-    """Estimate the least curvature on a conservative feasible tangent space."""
-    parameters = np.asarray(parameters, dtype=np.float64)
-    gradient = np.asarray(gradient, dtype=np.float64)
-    gaps = parameters[1:]
-    gap_gradient = gradient[1:]
-    scale = max(1.0, float(np.abs(gaps).max()))
-    active = gaps <= minimum_gap + 64.0 * np.finfo(np.float64).eps * scale
-    if np.all(active):
-        active = np.zeros_like(active)
-    multiplier = float(gap_gradient[~active].mean())
-    multiplier_tolerance = np.sqrt(np.finfo(np.float64).eps) * max(
-        1.0, float(np.abs(gap_gradient).max())
-    )
-    strongly_active = active & (gap_gradient - multiplier > multiplier_tolerance)
-
-    constraints = [np.asarray([0.0, 1.0, 1.0, 1.0, 1.0])]
-    for gap_index in np.flatnonzero(strongly_active):
-        constraint = np.zeros(5, dtype=np.float64)
-        constraint[gap_index + 1] = 1.0
-        constraints.append(constraint)
-    tangent = scipy.linalg.null_space(np.vstack(constraints))
-
-    hessian_times_tangent = []
-    base_step = np.cbrt(np.finfo(np.float64).eps)
-    for direction in tangent.T:
-        moving = np.abs(direction[1:]) > 0.0
-        step = base_step
-        if np.any(moving):
-            step = min(
-                step,
-                0.25
-                * float(
-                    np.min(gaps[moving] / np.abs(direction[1:][moving]))
-                ),
-            )
-        forward = gradient_function(parameters + step * direction)
-        backward = gradient_function(parameters - step * direction)
-        hessian_times_tangent.append((forward - backward) / (2.0 * step))
-    projected = tangent.T @ np.column_stack(hessian_times_tangent)
-    projected = 0.5 * (projected + projected.T)
-    return float(scipy.linalg.eigvalsh(projected, check_finite=False)[0])
+    probabilities = (gaps - minimum_gap) / (1.0 - 4.0 * minimum_gap)
+    if np.any(probabilities <= 0.0):
+        raise ValueError("each cyclic knot gap must exceed minimum_gap")
+    return np.concatenate(([knots[0]], np.log(probabilities[:3] / probabilities[3])))
 
 
 def random_knots(seed: int, minimum_gap: float = 0.03) -> FloatArray:
     """Draw an ordered cyclic four-knot initialization for one random seed."""
     if not isinstance(seed, int) or isinstance(seed, bool):
         raise TypeError("seed must be an integer")
-    minimum_gap = _validated_minimum_gap(minimum_gap)
+    if not 0.0 <= minimum_gap < 0.25:
+        raise ValueError("minimum_gap must lie in [0, 0.25)")
     rng = np.random.default_rng(seed)
     gaps = minimum_gap + (1.0 - 4.0 * minimum_gap) * rng.dirichlet(np.ones(4))
     origin = float(rng.uniform())
@@ -424,7 +311,7 @@ def face_gradient_basis(mesh: Mesh) -> tuple[FloatArray, FloatArray]:
 
 
 class HarmonicBoundaryOptimizer:
-    """Optimize zero- and one-target arcs on one manifold boundary loop."""
+    """Optimize two constant arcs on a mesh with one manifold boundary loop."""
 
     def __init__(
         self,
@@ -433,258 +320,97 @@ class HarmonicBoundaryOptimizer:
         minimum_gap: float = 0.03,
         target_arc_width: float | None = None,
         width_weight: float = 0.0,
-        boundary_penalty: float = 100.0,
     ) -> None:
-        minimum_gap = _validated_minimum_gap(minimum_gap)
+        if not np.isfinite(minimum_gap) or not 0.0 < minimum_gap < 0.25:
+            raise ValueError("minimum_gap must lie in (0, 0.25)")
         self.mesh = mesh
-        self.minimum_gap = minimum_gap
+        self.minimum_gap = float(minimum_gap)
         if target_arc_width is not None and (
             not np.isfinite(target_arc_width)
-            or not minimum_gap <= target_arc_width <= 0.5 - minimum_gap
+            or not minimum_gap < target_arc_width < 0.5 - minimum_gap
         ):
             raise ValueError(
-                "target_arc_width must lie in [minimum_gap, 0.5 - minimum_gap]"
+                "target_arc_width must lie between minimum_gap and 0.5 - minimum_gap"
             )
         if not np.isfinite(width_weight) or width_weight < 0.0:
             raise ValueError("width_weight must be finite and non-negative")
         if width_weight > 0.0 and target_arc_width is None:
             raise ValueError("positive width_weight requires target_arc_width")
-        if not np.isfinite(boundary_penalty) or boundary_penalty <= 0.0:
-            raise ValueError("boundary_penalty must be finite and positive")
         self.target_arc_width = (
             None if target_arc_width is None else float(target_arc_width)
         )
         self.width_weight = float(width_weight)
-        self.boundary_penalty = float(boundary_penalty)
         self.boundary_vertices = boundary_loop(mesh.faces)
         self.boundary_positions = boundary_arclength(
             mesh.vertices, self.boundary_vertices
         )
-        self._boundary_edge_lengths = np.diff(np.append(self.boundary_positions, 1.0))
-        stiffness = cotangent_stiffness(mesh).tocsc()
-        component_count = scipy.sparse.csgraph.connected_components(
-            stiffness, directed=False, return_labels=False
-        )
-        if component_count != 1:
-            raise ValueError("mesh must be connected")
-
         interior_mask = np.ones(len(mesh.vertices), dtype=bool)
         interior_mask[self.boundary_vertices] = False
         self.interior_vertices = np.flatnonzero(interior_mask).astype(np.int64)
+        if len(self.interior_vertices) == 0:
+            raise ValueError("mesh has no interior vertices")
 
-        # E maps boundary values to the complete harmonic field: u = E @ u_B.
-        harmonic_lift = np.zeros(
-            (len(mesh.vertices), len(self.boundary_vertices)),
-            dtype=np.float64,
-        )
-        harmonic_lift[self.boundary_vertices] = np.eye(len(self.boundary_vertices))
-        boundary_block = stiffness[self.boundary_vertices][
+        stiffness = cotangent_stiffness(mesh)
+        self._interior_block = stiffness[self.interior_vertices][
+            :, self.interior_vertices
+        ].tocsc()
+        self._coupling_block = stiffness[self.interior_vertices][
             :, self.boundary_vertices
-        ].toarray()
-        if len(self.interior_vertices):
-            interior_block = stiffness[self.interior_vertices][
-                :, self.interior_vertices
-            ].tocsc()
-            coupling = stiffness[self.interior_vertices][
-                :, self.boundary_vertices
-            ].toarray()
-            try:
-                interior_factorization = scipy.sparse.linalg.splu(interior_block)
-            except RuntimeError as exc:
-                raise ValueError("mesh interior harmonic block is singular") from exc
-            harmonic_extension = -interior_factorization.solve(coupling)
-            harmonic_lift[self.interior_vertices] = harmonic_extension
-            boundary_block += coupling.T @ harmonic_extension
-        self._harmonic_lift = harmonic_lift
-
-        # ponytail: dense Schur assumes B << V; add a sparse fallback only if
-        # thin meshes with boundary-scale B become a measured workload.
-        self._boundary_schur = np.asarray(
-            0.5 * (boundary_block + boundary_block.T), dtype=np.float64
-        )
+        ].tocsr()
+        try:
+            self._factorization = scipy.sparse.linalg.splu(self._interior_block)
+        except RuntimeError as exc:
+            raise ValueError(
+                "mesh interior is not connected to the selected boundary loop"
+            ) from exc
 
         self.face_areas, self._gradient_basis = face_gradient_basis(mesh)
         self._face_weights = self.face_areas / self.face_areas.sum()
 
-        for array in (
-            self.boundary_vertices,
-            self.boundary_positions,
-            self.interior_vertices,
-            self.face_areas,
-            self._boundary_edge_lengths,
-            self._harmonic_lift,
-            self._boundary_schur,
-            self._gradient_basis,
-            self._face_weights,
-        ):
-            array.setflags(write=False)
+    def extend(self, boundary_values: FloatArray) -> FloatArray:
+        """Harmonically extend one value per ordered boundary vertex."""
+        boundary_values = np.asarray(boundary_values, dtype=np.float64).reshape(-1)
+        if boundary_values.shape != self.boundary_vertices.shape:
+            raise ValueError(
+                "boundary_values must contain one value per boundary vertex"
+            )
+        field = np.empty(len(self.mesh.vertices), dtype=np.float64)
+        field[self.boundary_vertices] = boundary_values
+        right_hand_side = -(self._coupling_block @ boundary_values)
+        field[self.interior_vertices] = self._factorization.solve(right_hand_side)
+        return field
 
-    @staticmethod
-    def _mass_antiderivative(value: FloatArray) -> FloatArray:
-        """Antiderivatives of ``(1-t)^2``, ``(1-t)t``, and ``t^2``."""
-        return np.stack(
-            (
-                value - value**2 + value**3 / 3.0,
-                value**2 / 2.0 - value**3 / 3.0,
-                value**3 / 3.0,
-            ),
-            axis=-1,
+    def extend_adjoint(self, field_sensitivity: FloatArray) -> FloatArray:
+        """Apply the exact transpose of :meth:`extend`."""
+        field_sensitivity = np.asarray(field_sensitivity, dtype=np.float64).reshape(-1)
+        if field_sensitivity.shape != (len(self.mesh.vertices),):
+            raise ValueError("field_sensitivity must contain one value per vertex")
+        interior_adjoint = self._factorization.solve(
+            field_sensitivity[self.interior_vertices], trans="T"
         )
-
-    def _arc_mass(self, start: float, end: float) -> FloatArray:
-        """Exactly integrate the boundary P1 mass over one arc."""
-        matrix = np.zeros(
-            (len(self.boundary_vertices), len(self.boundary_vertices)),
+        return np.asarray(
+            field_sensitivity[self.boundary_vertices]
+            - self._coupling_block.T @ interior_adjoint,
             dtype=np.float64,
         )
-        local_start, local_end, wrapped_end = _arc_edge_coordinates(
-            self.boundary_positions, self._boundary_edge_lengths, start, end
-        )
-        integral = self._boundary_edge_lengths[:, None] * (
-            self._mass_antiderivative(local_end)
-            - self._mass_antiderivative(local_start)
-            + self._mass_antiderivative(wrapped_end)
-        )
-        edge = np.arange(len(self.boundary_vertices))
-        following = (edge + 1) % len(self.boundary_vertices)
-        matrix[edge, edge] += integral[:, 0]
-        matrix[edge, following] += integral[:, 1]
-        matrix[following, edge] += integral[:, 1]
-        matrix[following, following] += integral[:, 2]
-        return matrix
 
-    def _system_from_knots(self, knots: FloatArray) -> tuple[FloatArray, FloatArray]:
-        knots = _validated_knots(knots)
-        zero_mass = self._arc_mass(float(knots[0]), float(knots[1]))
-        one_mass = self._arc_mass(float(knots[2]), float(knots[3]))
-        matrix = self._boundary_schur + self.boundary_penalty * (zero_mass + one_mass)
-        right_hand_side = self.boundary_penalty * one_mass.sum(axis=1)
-        return matrix, right_hand_side
-
-    def _solve(self, knots: FloatArray) -> tuple[FloatArray, tuple[FloatArray, bool]]:
-        matrix, right_hand_side = self._system_from_knots(knots)
-        try:
-            factorization = scipy.linalg.cho_factor(
-                matrix, lower=True, check_finite=False
-            )
-        except np.linalg.LinAlgError as exc:
-            raise ValueError(
-                "reduced harmonic system is not positive definite"
-            ) from exc
-        boundary_field = scipy.linalg.cho_solve(
-            factorization, right_hand_side, check_finite=False
-        )
-        field = self._harmonic_lift @ boundary_field
-        return field, factorization
-
-    def robin_field_from_knots(self, knots: FloatArray) -> FloatArray:
-        """Solve the latent Robin field for four ordered knots."""
-        field, _ = self._solve(knots)
-        return field
-
-    def _canonicalize_field(
-        self, robin_field: FloatArray, knots: FloatArray
-    ) -> tuple[FloatArray, BoundaryStatistics]:
-        """Fix the affine gauge using exact target-arc means."""
-        knots = _validated_knots(knots)
-        boundary_field = np.asarray(robin_field, dtype=np.float64)[
-            self.boundary_vertices
-        ]
-        zero_mass = self._arc_mass(float(knots[0]), float(knots[1]))
-        one_mass = self._arc_mass(float(knots[2]), float(knots[3]))
-        zero_length = float(zero_mass.sum())
-        one_length = float(one_mass.sum())
-        zero_mean = float(zero_mass.sum(axis=0) @ boundary_field / zero_length)
-        one_mean = float(one_mass.sum(axis=0) @ boundary_field / one_length)
-        span = one_mean - zero_mean
-        threshold = np.sqrt(np.finfo(np.float64).eps) * max(
-            1.0, abs(zero_mean), abs(one_mean)
-        )
-        if not np.isfinite(span) or span <= threshold:
-            raise ValueError(
-                "target-arc mean span is too small for canonicalization: "
-                f"zero_mean={zero_mean:.16g}, one_mean={one_mean:.16g}, "
-                f"span={span:.16g}"
-            )
-
-        zero_second_moment = float(
-            boundary_field @ (zero_mass @ boundary_field) / zero_length
-        )
-        one_residual = boundary_field - 1.0
-        one_target_second_moment = float(
-            one_residual @ (one_mass @ one_residual) / one_length
-        )
-        field = (np.asarray(robin_field, dtype=np.float64) - zero_mean) / span
-        canonical_boundary_field = field[self.boundary_vertices]
-        canonical_one_residual = canonical_boundary_field - 1.0
-        canonical_zero_second_moment = float(
-            canonical_boundary_field
-            @ (zero_mass @ canonical_boundary_field)
-            / zero_length
-        )
-        canonical_one_second_moment = float(
-            canonical_one_residual @ (one_mass @ canonical_one_residual) / one_length
-        )
-        statistics = BoundaryStatistics(
-            raw_zero_mean=zero_mean,
-            raw_one_mean=one_mean,
-            raw_span=span,
-            raw_zero_target_rms=float(np.sqrt(max(zero_second_moment, 0.0))),
-            raw_one_target_rms=float(np.sqrt(max(one_target_second_moment, 0.0))),
-            canonical_zero_target_rms=float(
-                np.sqrt(max(canonical_zero_second_moment, 0.0))
-            ),
-            canonical_one_target_rms=float(
-                np.sqrt(max(canonical_one_second_moment, 0.0))
-            ),
-        )
-        return field, statistics
-
-    def field_and_boundary_statistics_from_knots(
-        self, knots: FloatArray
-    ) -> tuple[FloatArray, BoundaryStatistics]:
-        """Return the canonical field and gauge-explicit boundary diagnostics."""
-        robin_field = self.robin_field_from_knots(knots)
-        return self._canonicalize_field(robin_field, knots)
-
-    def field_from_knots(self, knots: FloatArray) -> FloatArray:
-        """Return the canonical harmonic field with target-arc means zero and one."""
-        field, _ = self.field_and_boundary_statistics_from_knots(knots)
-        return field
-
-    def field_and_arc_weights(
-        self, knots: FloatArray
-    ) -> tuple[FloatArray, FloatArray, FloatArray]:
-        """Return the field and per-edge zero/one arc coverage for display."""
-        field = self.field_from_knots(knots)
-        zero_weights, one_weights = cyclic_arc_edge_weights(
-            self.boundary_positions, knots
-        )
-        return field, zero_weights, one_weights
-
-    def _face_gradients(self, field: FloatArray) -> FloatArray:
-        face_values = field[self.mesh.faces]
-        return np.einsum("fij,fi->fj", self._gradient_basis, face_values)
-
-    def _uniformity_loss_and_gradient(
+    def _loss_and_field_gradient(
         self, field: FloatArray
-    ) -> tuple[float, FloatArray]:
-        gradients = self._face_gradients(field)
+    ) -> tuple[float, FloatArray, FieldStatistics]:
+        face_values = field[self.mesh.faces]
+        gradients = np.einsum("fij,fi->fj", self._gradient_basis, face_values)
         squared_norms = np.einsum("ij,ij->i", gradients, gradients)
         mean_squared = float(self._face_weights @ squared_norms)
         if not np.isfinite(mean_squared) or mean_squared <= 0.0:
             raise ValueError("harmonic field has zero or invalid gradient energy")
-        normalized_squared_norms = squared_norms / mean_squared
-        loss = float(self._face_weights @ (normalized_squared_norms - 1.0) ** 2)
-        normalized_second_moment = float(
-            self._face_weights @ normalized_squared_norms**2
-        )
+        second_moment = float(self._face_weights @ squared_norms**2)
+        loss = second_moment / mean_squared**2 - 1.0
 
         coefficients = (
             4.0
             * self._face_weights
-            * (normalized_squared_norms - normalized_second_moment)
-            / mean_squared
+            * (squared_norms - second_moment / mean_squared)
+            / mean_squared**2
         )
         face_sensitivity = coefficients[:, None] * gradients
         corner_sensitivity = np.einsum(
@@ -695,191 +421,106 @@ class HarmonicBoundaryOptimizer:
             weights=corner_sensitivity.reshape(-1),
             minlength=len(self.mesh.vertices),
         ).astype(np.float64)
-        return loss, field_sensitivity
 
-    def _field_statistics(self, field: FloatArray) -> FieldStatistics:
-        norms = np.linalg.norm(self._face_gradients(field), axis=1)
+        norms = np.sqrt(squared_norms)
         mean_norm = float(self._face_weights @ norms)
-        gradient_variance = float(self._face_weights @ (norms - mean_norm) ** 2)
-        if np.any(norms <= 0.0):
-            spacing_cv = np.inf
-        else:
-            spacings = float(norms.min()) / norms
-            mean_spacing = float(self._face_weights @ spacings)
-            spacing_variance = float(
-                self._face_weights @ (spacings - mean_spacing) ** 2
-            )
-            spacing_cv = float(np.sqrt(max(spacing_variance, 0.0)) / mean_spacing)
-        return FieldStatistics(
-            gradient_cv=float(
-                np.sqrt(max(gradient_variance, 0.0)) / max(mean_norm, 1.0e-15)
-            ),
-            spacing_cv=spacing_cv,
+        variance = float(self._face_weights @ (norms - mean_norm) ** 2)
+        statistics = FieldStatistics(
+            spacing_cv=float(np.sqrt(max(variance, 0.0)) / max(mean_norm, 1.0e-15)),
             minimum_gradient=float(norms.min()),
             maximum_gradient=float(norms.max()),
         )
+        return loss, field_sensitivity, statistics
 
-    def _width_loss_and_knot_gradient(
-        self, gaps: FloatArray
+    def _width_loss_and_gradient(
+        self, gaps: FloatArray, knot_jacobian: FloatArray
     ) -> tuple[float, FloatArray]:
         if self.width_weight == 0.0 or self.target_arc_width is None:
             return 0.0, np.zeros(4, dtype=np.float64)
         target = self.target_arc_width
-        residual = (gaps[[0, 2]] - target) / target
+        plateau_indices = np.asarray([0, 2])
+        residual = (gaps[plateau_indices] - target) / target
         loss = self.width_weight * float(residual @ residual)
-        gradient = (2.0 * self.width_weight / target) * np.asarray(
-            (-residual[0], residual[0], -residual[1], residual[1])
-        )
-        return loss, gradient
-
-    def loss_and_gradient(self, parameters: FloatArray) -> tuple[float, FloatArray]:
-        """Return loss and its exact gradient in five simplex coordinates."""
-        knots, knot_jacobian, gaps = knots_from_parameters(parameters)
-        field, factorization = self._solve(knots)
-        uniformity_loss, d_loss_d_field = self._uniformity_loss_and_gradient(field)
-        boundary_field = field[self.boundary_vertices]
-        d_loss_d_boundary_field = self._harmonic_lift.T @ d_loss_d_field
-        adjoint = scipy.linalg.cho_solve(
-            factorization, d_loss_d_boundary_field, check_finite=False
-        )
-        field_at_knots = np.interp(
-            knots % 1.0, self.boundary_positions, boundary_field, period=1.0
-        )
-        adjoint_at_knots = np.interp(
-            knots % 1.0, self.boundary_positions, adjoint, period=1.0
-        )
-        d_loss_d_knots = self.boundary_penalty * np.asarray(
+        gap_gradient = np.zeros(4, dtype=np.float64)
+        gap_gradient[plateau_indices] = 2.0 * self.width_weight * residual / target
+        gap_jacobian = np.vstack(
             (
-                adjoint_at_knots[0] * field_at_knots[0],
-                -adjoint_at_knots[1] * field_at_knots[1],
-                -adjoint_at_knots[2] * (1.0 - field_at_knots[2]),
-                adjoint_at_knots[3] * (1.0 - field_at_knots[3]),
+                knot_jacobian[1] - knot_jacobian[0],
+                knot_jacobian[2] - knot_jacobian[1],
+                knot_jacobian[3] - knot_jacobian[2],
+                knot_jacobian[0] - knot_jacobian[3],
             )
         )
-        width_loss, width_knot_gradient = self._width_loss_and_knot_gradient(gaps)
+        return loss, gap_jacobian.T @ gap_gradient
+
+    def loss_and_gradient(self, parameters: FloatArray) -> tuple[float, FloatArray]:
+        """Return the scale-invariant field loss and exact four-vector gradient."""
+        knots, knot_jacobian, gaps = knots_from_parameters(parameters, self.minimum_gap)
+        boundary_values, profile_jacobian = cyclic_boundary_profile(
+            self.boundary_positions, knots
+        )
+        field = self.extend(boundary_values)
+        uniformity_loss, field_sensitivity, _ = self._loss_and_field_gradient(field)
+        boundary_sensitivity = self.extend_adjoint(field_sensitivity)
+        knot_gradient = profile_jacobian.T @ boundary_sensitivity
+        width_loss, width_gradient = self._width_loss_and_gradient(gaps, knot_jacobian)
         return (
             uniformity_loss + width_loss,
-            knot_jacobian.T @ (d_loss_d_knots + width_knot_gradient),
+            knot_jacobian.T @ knot_gradient + width_gradient,
         )
 
     def optimize(
         self,
         initial_knots: FloatArray,
         *,
-        max_iterations: int = 100,
+        max_iterations: int = 60,
+        seed: int | None = None,
     ) -> OptimizationResult:
-        """Run direct-simplex SLSQP from one ordered four-knot initialization."""
+        """Run L-BFGS from one ordered cyclic four-knot initialization."""
         if not isinstance(max_iterations, int) or isinstance(max_iterations, bool):
             raise TypeError("max_iterations must be an integer")
         if max_iterations < 1:
             raise ValueError("max_iterations must be positive")
-        initial_parameters = parameters_from_knots(initial_knots)
-        _, _, initial_gaps = knots_from_parameters(initial_parameters)
-        if np.any(initial_gaps < self.minimum_gap - 1.0e-12):
-            raise ValueError("each initial cyclic gap must be at least minimum_gap")
-
-        cached_parameters: FloatArray | None = None
-        cached_value: tuple[float, FloatArray] | None = None
-        evaluation_count = 0
-
-        def objective(parameters: FloatArray) -> tuple[float, FloatArray]:
-            nonlocal cached_parameters, cached_value, evaluation_count
-            parameters = np.asarray(parameters, dtype=np.float64)
-            if cached_parameters is not None and np.array_equal(
-                parameters, cached_parameters
-            ):
-                assert cached_value is not None
-                return cached_value
-            cached_parameters = parameters.copy()
-            cached_value = self.loss_and_gradient(parameters)
-            evaluation_count += 1
-            return cached_value
-
-        initial_loss, _ = objective(initial_parameters)
+        initial_parameters = parameters_from_knots(initial_knots, self.minimum_gap)
+        initial_loss, _ = self.loss_and_gradient(initial_parameters)
         history = [float(initial_loss)]
         parameter_history = [initial_parameters.copy()]
 
-        def record(parameters: FloatArray) -> None:
-            parameters = np.asarray(parameters, dtype=np.float64)
-            loss, _ = objective(parameters)
-            if np.array_equal(parameter_history[-1], parameters):
-                history[-1] = float(loss)
-            else:
-                parameter_history.append(parameters.copy())
-                history.append(float(loss))
+        def callback(intermediate_result: scipy.optimize.OptimizeResult) -> None:
+            parameter_history.append(
+                np.asarray(intermediate_result.x, dtype=np.float64).copy()
+            )
+            history.append(float(intermediate_result.fun))
 
         result = scipy.optimize.minimize(
-            objective,
+            self.loss_and_gradient,
             initial_parameters,
             jac=True,
-            method="SLSQP",
-            bounds=scipy.optimize.Bounds(
-                [-np.inf] + [self.minimum_gap] * 4,
-                [np.inf] * 5,
-            ),
-            constraints=scipy.optimize.LinearConstraint(
-                np.asarray([0.0, 1.0, 1.0, 1.0, 1.0]),
-                1.0,
-                1.0,
-            ),
-            callback=record,
+            method="L-BFGS-B",
+            callback=callback,
             options={
                 "maxiter": max_iterations,
-                "ftol": 1.0e-14,
+                "ftol": 1.0e-12,
+                "gtol": 1.0e-8,
+                "maxls": 30,
             },
         )
 
         parameters = np.asarray(result.x, dtype=np.float64)
-        knots, knot_jacobian, gaps = knots_from_parameters(parameters)
-        robin_field = self.robin_field_from_knots(knots)
-        field, boundary_statistics = self._canonicalize_field(robin_field, knots)
-        uniformity_loss, _ = self._uniformity_loss_and_gradient(robin_field)
-        width_loss, _ = self._width_loss_and_knot_gradient(gaps)
-        statistics = self._field_statistics(field)
+        knots, knot_jacobian, gaps = knots_from_parameters(parameters, self.minimum_gap)
+        boundary_values, _ = cyclic_boundary_profile(self.boundary_positions, knots)
+        field = self.extend(boundary_values)
+        uniformity_loss, _, statistics = self._loss_and_field_gradient(field)
+        width_loss, _ = self._width_loss_and_gradient(gaps, knot_jacobian)
         final_loss = uniformity_loss + width_loss
-        record(parameters)
-        history[-1] = float(final_loss)
-        _, final_gradient = objective(parameters)
-        raw_gaps = parameters[1:]
-        constraint_violation = float(
-            max(
-                0.0,
-                self.minimum_gap - raw_gaps.min(),
-                self.minimum_gap - gaps.min(),
-                abs(float(raw_gaps.sum()) - 1.0),
-            )
-        )
-        kkt_residual = _gap_kkt_residual(final_gradient, raw_gaps, self.minimum_gap)
-        vertex_distances = np.min(
-            np.abs(
-                (knots[:, None] - self.boundary_positions[None, :] + 0.5) % 1.0
-                - 0.5
-            ),
-            axis=1,
-        )
-        finite_difference_motion = np.cbrt(np.finfo(np.float64).eps) * np.linalg.norm(
-            knot_jacobian, axis=1
-        )
-        if np.any(vertex_distances <= finite_difference_motion):
-            minimum_projected_hessian_eigenvalue = np.nan
+        if np.array_equal(parameter_history[-1], parameters):
+            history[-1] = float(final_loss)
         else:
-            minimum_projected_hessian_eigenvalue = (
-                _minimum_projected_hessian_eigenvalue(
-                    lambda point: self.loss_and_gradient(point)[1],
-                    parameters,
-                    final_gradient,
-                    self.minimum_gap,
-                )
-            )
-        success = bool(
-            result.success and constraint_violation <= 1.0e-8 and kkt_residual <= 1.0e-5
-        )
-        message = (
-            f"{result.message}; constraint_violation={constraint_violation:.3e}; "
-            f"kkt_residual={kkt_residual:.3e}"
-        )
+            parameter_history.append(parameters.copy())
+            history.append(float(final_loss))
         return OptimizationResult(
-            initial_loss=history[0],
+            seed=seed,
+            initial_loss=float(initial_loss),
             final_loss=float(final_loss),
             uniformity_loss=float(uniformity_loss),
             width_loss=float(width_loss),
@@ -888,17 +529,11 @@ class HarmonicBoundaryOptimizer:
             parameters=parameters,
             knots=knots,
             gaps=gaps,
-            raw_field=robin_field,
             field=field,
             statistics=statistics,
-            boundary_statistics=boundary_statistics,
             iterations=int(result.nit),
-            evaluations=evaluation_count,
-            constraint_violation=constraint_violation,
-            kkt_residual=kkt_residual,
-            minimum_projected_hessian_eigenvalue=(
-                minimum_projected_hessian_eigenvalue
-            ),
-            success=success,
-            message=message,
+            evaluations=int(result.nfev),
+            gradient_norm=float(np.linalg.norm(result.jac)),
+            success=bool(result.success),
+            message=str(result.message),
         )

@@ -9,7 +9,7 @@ import numpy as np
 
 from boundary_opt import (
     HarmonicBoundaryOptimizer,
-    cyclic_arc_edge_weights,
+    cyclic_boundary_profile,
     knots_from_parameters,
     load_obj,
     random_knots,
@@ -22,9 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--minimum-gap", type=float, default=0.03)
-    parser.add_argument("--target-arc-width", type=float, default=None)
-    parser.add_argument("--width-weight", type=float, default=0.0)
-    parser.add_argument("--boundary-penalty", type=float, default=100.0)
+    parser.add_argument("--target-arc-width", type=float, default=0.10)
+    parser.add_argument("--width-weight", type=float, default=0.10)
     parser.add_argument(
         "--screenshot",
         type=Path,
@@ -34,14 +33,14 @@ def parse_args() -> argparse.Namespace:
         "--show", action="store_true", help="open the interactive viewer"
     )
     parser.add_argument(
-        "--final-only",
-        action="store_true",
-        help="show only the optimized result with standard Polyscope panels",
-    )
-    parser.add_argument(
         "--animate",
         action="store_true",
-        help="loop over recorded optimizer states in the viewer",
+        help="loop over accepted optimization iterations in the viewer",
+    )
+    parser.add_argument(
+        "--final-only",
+        action="store_true",
+        help="show only the optimized field with the standard Polyscope panels",
     )
     parser.add_argument("--fps", type=float, default=8.0)
     return parser.parse_args()
@@ -49,7 +48,7 @@ def parse_args() -> argparse.Namespace:
 
 def add_field_quantity(surface: object, field: np.ndarray) -> None:
     surface.add_scalar_quantity(
-        "canonical harmonic field",
+        "harmonic field",
         field,
         cmap="viridis",
         vminmax=(0.0, 1.0),
@@ -82,7 +81,59 @@ def register_surface(
     return surface
 
 
+def plateau_segments(
+    boundary_points: np.ndarray, values: np.ndarray, target: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compact line segments whose endpoints lie on one exact plateau."""
+    selected = np.isclose(values, target, rtol=0.0, atol=1.0e-12)
+    edge_mask = selected & np.roll(selected, -1)
+    starts = np.flatnonzero(edge_mask)
+    segment_points = np.stack(
+        (boundary_points[starts], boundary_points[(starts + 1) % len(values)]), axis=1
+    ).reshape((-1, 3))
+    edges = np.arange(len(segment_points), dtype=np.int64).reshape((-1, 2))
+    return segment_points, edges
+
+
 def register_state(
+    ps: object,
+    optimizer: HarmonicBoundaryOptimizer,
+    display_vertices: np.ndarray,
+    label: str,
+    field: np.ndarray,
+    boundary_values: np.ndarray,
+    offset: np.ndarray,
+) -> None:
+    vertices = display_vertices + offset
+    register_surface(ps, optimizer, label, vertices, field)
+
+    boundary_points = vertices[optimizer.boundary_vertices]
+    for name, target, color in (
+        ("min = 0", 0.0, (0.08, 0.28, 0.95)),
+        ("max = 1", 1.0, (0.95, 0.24, 0.08)),
+    ):
+        points, edges = plateau_segments(boundary_points, boundary_values, target)
+        curve = ps.register_curve_network(
+            f"{label} · {name}",
+            points,
+            edges,
+            radius=0.009,
+            color=color,
+        )
+        curve.set_material("flat")
+
+
+def boundary_edge_colors(values: np.ndarray) -> np.ndarray:
+    """Color exact zero/one plateau edges and mute transition edges."""
+    colors = np.full((len(values), 3), (0.45, 0.47, 0.50))
+    zero = np.isclose(values, 0.0, rtol=0.0, atol=1.0e-12)
+    one = np.isclose(values, 1.0, rtol=0.0, atol=1.0e-12)
+    colors[zero & np.roll(zero, -1)] = (0.08, 0.28, 0.95)
+    colors[one & np.roll(one, -1)] = (0.95, 0.24, 0.08)
+    return colors
+
+
+def register_animation_state(
     ps: object,
     optimizer: HarmonicBoundaryOptimizer,
     display_vertices: np.ndarray,
@@ -95,7 +146,7 @@ def register_state(
     surface = register_surface(ps, optimizer, label, vertices, field)
     boundary_points = vertices[optimizer.boundary_vertices]
     boundary = ps.register_curve_network(
-        f"{label} · boundary targets",
+        f"{label} · boundary",
         boundary_points,
         "loop",
         radius=0.009,
@@ -110,29 +161,19 @@ def register_state(
     return surface, boundary
 
 
-def boundary_edge_colors(
-    zero_weights: np.ndarray, one_weights: np.ndarray
-) -> np.ndarray:
-    """Blend edge colors by exact zero-arc, one-arc, and free coverage."""
-    free_weights = np.clip(1.0 - zero_weights - one_weights, 0.0, 1.0)
-    return (
-        free_weights[:, None] * np.asarray((0.45, 0.47, 0.50))
-        + zero_weights[:, None] * np.asarray((0.08, 0.28, 0.95))
-        + one_weights[:, None] * np.asarray((0.95, 0.24, 0.08))
-    )
-
-
 def optimization_frames(
     optimizer: HarmonicBoundaryOptimizer, parameter_history: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Evaluate harmonic fields and boundary colors at recorded optimizer states."""
+    """Evaluate harmonic fields and boundary colors along an accepted trajectory."""
     fields = []
     colors = []
     for parameters in parameter_history:
-        knots, _, _ = knots_from_parameters(parameters)
-        field, minimum_weights, maximum_weights = optimizer.field_and_arc_weights(knots)
-        fields.append(field)
-        colors.append(boundary_edge_colors(minimum_weights, maximum_weights))
+        knots, _, _ = knots_from_parameters(parameters, optimizer.minimum_gap)
+        boundary_values, _ = cyclic_boundary_profile(
+            optimizer.boundary_positions, knots
+        )
+        fields.append(optimizer.extend(boundary_values))
+        colors.append(boundary_edge_colors(boundary_values))
     return np.stack(fields), np.stack(colors)
 
 
@@ -223,7 +264,7 @@ def make_animation_callback(
     losses: np.ndarray,
     fps: float,
 ):
-    """Return an auto-looping recorded-state playback callback."""
+    """Return an auto-looping accepted-iteration playback callback."""
     hold = max(1, round(fps))
     sequence = np.concatenate(
         (
@@ -258,7 +299,7 @@ def make_animation_callback(
         draw_label(
             psim,
             0.75 * width,
-            f"STATE {state['frame']} / {len(fields) - 1}",
+            f"ITERATION {state['frame']} / {len(fields) - 1}",
             f"loss = {losses[state['frame']]:.6f}",
             rgba8(5, 150, 105),
         )
@@ -269,7 +310,7 @@ def make_animation_callback(
 def main() -> None:
     args = parse_args()
     if args.animate and args.final_only:
-        raise SystemExit("--animate and --final-only cannot be used together")
+        raise SystemExit("--animate and --final-only are mutually exclusive")
     if args.animate and (not np.isfinite(args.fps) or not 0.0 < args.fps <= 60.0):
         raise SystemExit("--fps must lie in (0, 60]")
     try:
@@ -286,16 +327,16 @@ def main() -> None:
         minimum_gap=args.minimum_gap,
         target_arc_width=args.target_arc_width,
         width_weight=args.width_weight,
-        boundary_penalty=args.boundary_penalty,
     )
     initial_knots = random_knots(args.seed, args.minimum_gap)
-    initial_field, initial_zero, initial_one = optimizer.field_and_arc_weights(
-        initial_knots
+    initial_boundary, _ = cyclic_boundary_profile(
+        optimizer.boundary_positions, initial_knots
     )
-    initial_colors = boundary_edge_colors(initial_zero, initial_one)
+    initial_field = optimizer.extend(initial_boundary)
     result = optimizer.optimize(
         initial_knots,
         max_iterations=args.iterations,
+        seed=args.seed,
     )
 
     display_vertices = principal_axis_view(mesh.vertices)
@@ -321,7 +362,7 @@ def main() -> None:
 
     if args.animate:
         fields, colors = optimization_frames(optimizer, result.parameter_history)
-        register_state(
+        register_animation_state(
             ps,
             optimizer,
             display_vertices,
@@ -330,7 +371,7 @@ def main() -> None:
             colors[0],
             np.zeros(3),
         )
-        surface, boundary = register_state(
+        surface, boundary = register_animation_state(
             ps,
             optimizer,
             display_vertices,
@@ -339,7 +380,7 @@ def main() -> None:
             colors[0],
             translation,
         )
-        field_buffer = surface.get_quantity_buffer("canonical harmonic field", "values")
+        field_buffer = surface.get_quantity_buffer("harmonic field", "values")
         color_buffer = boundary.get_quantity_buffer("boundary state", "colors")
         ps.look_at(target + np.asarray([0.0, 5.5 * extent, 2.0 * extent]), target)
         ps.set_user_callback(
@@ -356,57 +397,70 @@ def main() -> None:
         )
         print(
             f"seed={args.seed} loss {result.initial_loss:.6f} -> "
-            f"{result.final_loss:.6f}; playing {len(fields)} recorded states"
+            f"{result.final_loss:.6f}; playing {len(fields)} accepted states"
         )
         ps.show()
         return
 
-    optimized_zero, optimized_one = cyclic_arc_edge_weights(
+    optimized_boundary, _ = cyclic_boundary_profile(
         optimizer.boundary_positions, result.knots
     )
-    optimized_colors = boundary_edge_colors(optimized_zero, optimized_one)
     if args.final_only:
         register_state(
             ps,
             optimizer,
             display_vertices,
-            "optimized",
+            f"optimized · seed {args.seed}",
             result.field,
-            optimized_colors,
+            optimized_boundary,
             np.zeros(3),
         )
         ps.look_at(center + np.asarray([0.0, 5.5 * extent, 2.0 * extent]), center)
-    else:
-        register_state(
+        screenshot = args.screenshot or Path("output") / (
+            f"{args.mesh.stem}_optimized_polyscope.png"
+        )
+        screenshot.parent.mkdir(parents=True, exist_ok=True)
+        ps.show(forFrames=5)
+        ps.screenshot(str(screenshot), transparent_bg=False, include_UI=True)
+        print(
+            f"seed={args.seed} optimized loss={result.final_loss:.6f}; "
+            f"wrote {screenshot}"
+        )
+        if args.show:
+            ps.show()
+        return
+
+    register_state(
+        ps,
+        optimizer,
+        display_vertices,
+        f"before · seed {args.seed}",
+        initial_field,
+        initial_boundary,
+        np.zeros(3),
+    )
+    register_state(
+        ps,
+        optimizer,
+        display_vertices,
+        "after",
+        result.field,
+        optimized_boundary,
+        translation,
+    )
+    ps.look_at(target + np.asarray([0.0, 5.5 * extent, 2.0 * extent]), target)
+
+    ps.set_user_callback(
+        make_label_callback(
             ps,
-            optimizer,
-            display_vertices,
-            f"before · seed {args.seed}",
-            initial_field,
-            initial_colors,
-            np.zeros(3),
+            psim,
+            result.initial_loss,
+            result.final_loss,
         )
-        register_state(
-            ps,
-            optimizer,
-            display_vertices,
-            "after",
-            result.field,
-            optimized_colors,
-            translation,
-        )
-        ps.look_at(target + np.asarray([0.0, 5.5 * extent, 2.0 * extent]), target)
-        ps.set_user_callback(
-            make_label_callback(
-                ps,
-                psim,
-                result.initial_loss,
-                result.final_loss,
-            )
-        )
+    )
 
     screenshot = args.screenshot or Path("output") / (
-        f"{args.mesh.stem}_{'optimized' if args.final_only else 'before_after'}_polyscope.png"
+        f"{args.mesh.stem}_before_after_polyscope.png"
     )
     screenshot.parent.mkdir(parents=True, exist_ok=True)
     ps.show(forFrames=5)
