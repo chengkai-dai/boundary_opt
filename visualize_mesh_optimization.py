@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--animate",
         action="store_true",
-        help="loop over accepted optimization iterations in the viewer",
+        help="loop over recorded optimizer states in the viewer",
     )
     parser.add_argument("--fps", type=float, default=8.0)
     return parser.parse_args()
@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
 
 def add_field_quantity(surface: object, field: np.ndarray) -> None:
     surface.add_scalar_quantity(
-        "harmonic field",
+        "canonical harmonic field",
         field,
         cmap="viridis",
         vminmax=(0.0, 1.0),
@@ -120,11 +120,11 @@ def boundary_edge_colors(
 def optimization_frames(
     optimizer: HarmonicBoundaryOptimizer, parameter_history: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Evaluate harmonic fields and boundary colors along an accepted trajectory."""
+    """Evaluate harmonic fields and boundary colors at recorded optimizer states."""
     fields = []
     colors = []
     for parameters in parameter_history:
-        knots, _, _ = knots_from_parameters(parameters, optimizer.minimum_gap)
+        knots, _, _ = knots_from_parameters(parameters)
         field, minimum_weights, maximum_weights = optimizer.field_and_arc_weights(knots)
         fields.append(field)
         colors.append(boundary_edge_colors(minimum_weights, maximum_weights))
@@ -218,7 +218,7 @@ def make_animation_callback(
     losses: np.ndarray,
     fps: float,
 ):
-    """Return an auto-looping accepted-iteration playback callback."""
+    """Return an auto-looping recorded-state playback callback."""
     hold = max(1, round(fps))
     sequence = np.concatenate(
         (
@@ -253,7 +253,7 @@ def make_animation_callback(
         draw_label(
             psim,
             0.75 * width,
-            f"ITERATION {state['frame']} / {len(fields) - 1}",
+            f"STATE {state['frame']} / {len(fields) - 1}",
             f"loss = {losses[state['frame']]:.6f}",
             rgba8(5, 150, 105),
         )
@@ -332,7 +332,7 @@ def main() -> None:
             colors[0],
             translation,
         )
-        field_buffer = surface.get_quantity_buffer("harmonic field", "values")
+        field_buffer = surface.get_quantity_buffer("canonical harmonic field", "values")
         color_buffer = boundary.get_quantity_buffer("boundary state", "colors")
         ps.look_at(target + np.asarray([0.0, 5.5 * extent, 2.0 * extent]), target)
         ps.set_user_callback(
@@ -349,7 +349,7 @@ def main() -> None:
         )
         print(
             f"seed={args.seed} loss {result.initial_loss:.6f} -> "
-            f"{result.final_loss:.6f}; playing {len(fields)} accepted states"
+            f"{result.final_loss:.6f}; playing {len(fields)} recorded states"
         )
         ps.show()
         return

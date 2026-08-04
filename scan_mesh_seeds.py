@@ -50,7 +50,7 @@ def main() -> None:
         f"penalty={optimizer.boundary_penalty:g} setup={setup_seconds:.4f}s"
     )
 
-    rows: list[dict[str, int | float | str]] = []
+    rows: list[dict[str, int | float | str | None]] = []
     history_rows: list[dict[str, int | float]] = []
     for seed in range(args.seeds):
         initial = random_knots(seed, args.minimum_gap)
@@ -61,7 +61,10 @@ def main() -> None:
         )
         optimize_seconds = time.perf_counter() - start
         reduction = relative_reduction(result.initial_loss, result.final_loss)
-        row: dict[str, int | float | str] = {
+        boundary = result.boundary_statistics
+        field_min = float(result.field.min())
+        field_max = float(result.field.max())
+        row: dict[str, int | float | str | None] = {
             "mesh": str(args.mesh),
             "vertices": len(mesh.vertices),
             "faces": len(mesh.faces),
@@ -80,14 +83,27 @@ def main() -> None:
             "iterations": result.iterations,
             "evaluations": result.evaluations,
             "success": int(result.success),
-            "gradient_norm": result.gradient_norm,
+            "constraint_violation": result.constraint_violation,
+            "kkt_residual": result.kkt_residual,
             "optimize_seconds": optimize_seconds,
+            "gradient_cv": result.statistics.gradient_cv,
             "spacing_cv": result.statistics.spacing_cv,
             "minimum_gradient": result.statistics.minimum_gradient,
             "maximum_gradient": result.statistics.maximum_gradient,
-            "arc_at_minimum": int(
+            "canonical_field_min": field_min,
+            "canonical_field_max": field_max,
+            "canonical_overshoot": max(0.0, -field_min, field_max - 1.0),
+            "raw_zero_mean": boundary.raw_zero_mean,
+            "raw_one_mean": boundary.raw_one_mean,
+            "raw_span": boundary.raw_span,
+            "raw_zero_target_rms": boundary.raw_zero_target_rms,
+            "raw_one_target_rms": boundary.raw_one_target_rms,
+            "canonical_zero_target_rms": boundary.canonical_zero_target_rms,
+            "canonical_one_target_rms": boundary.canonical_one_target_rms,
+            "target_arc_at_minimum": int(
                 min(result.gaps[0], result.gaps[2]) <= args.minimum_gap + 1.0e-4
             ),
+            "any_gap_at_minimum": int(result.gaps.min() <= args.minimum_gap + 1.0e-4),
             "message": result.message,
         }
         row.update(
@@ -103,17 +119,18 @@ def main() -> None:
         history_rows.extend(
             {
                 "seed": seed,
-                "iteration": iteration,
+                "recorded_state": state,
                 "loss": float(loss),
             }
-            for iteration, loss in enumerate(result.history)
+            for state, loss in enumerate(result.history)
         )
         print(
             f"seed={seed:02d} loss {result.initial_loss:.6f} -> {result.final_loss:.6f} "
             f"({100.0 * reduction:6.2f}%) uniform={result.uniformity_loss:.6f} "
-            f"width={result.width_loss:.6f} cv={result.statistics.spacing_cv:.4f} "
+            f"width={result.width_loss:.6f} spacing_cv={result.statistics.spacing_cv:.4f} "
+            f"span={boundary.raw_span:.4f} "
             f"iter={result.iterations:02d} time={optimize_seconds:.4f}s "
-            f"success={result.success}"
+            f"kkt={result.kkt_residual:.1e} success={result.success}"
         )
 
     output = args.output or Path("output") / f"{args.mesh.stem}_seed_scan.csv"
@@ -140,9 +157,13 @@ def main() -> None:
     )
     best = int(np.argmin(final))
     improved = int(np.sum(final < initial))
+    succeeded = int(sum(int(row["success"]) for row in rows))
     print(
-        f"saved {output} and {history_output}; improved={improved}/{len(rows)}, "
+        f"saved {output} and {history_output}; success={succeeded}/{len(rows)}, "
+        f"improved={improved}/{len(rows)}, "
         f"median_reduction={100.0 * float(np.median(reductions)):.2f}%, "
+        f"final_p90={float(np.quantile(final, 0.9)):.6f}, "
+        f"final_max={float(final.max()):.6f}, "
         f"median_time={float(np.median(timings)):.4f}s, "
         f"best_seed={rows[best]['seed']} best_loss={final[best]:.6f}"
     )

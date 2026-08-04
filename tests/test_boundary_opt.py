@@ -8,6 +8,7 @@ import pytest
 from boundary_opt import (
     HarmonicBoundaryOptimizer,
     Mesh,
+    _gap_kkt_residual,
     cotangent_stiffness,
     cyclic_arc_edge_weights,
     face_gradient_basis,
@@ -16,7 +17,7 @@ from boundary_opt import (
     parameters_from_knots,
     random_knots,
 )
-from plot_loss_curves import chart_svg
+from plot_loss_curves import chart_svg, read_histories
 from scan_mesh_seeds import relative_reduction
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -34,7 +35,7 @@ def optimizer() -> HarmonicBoundaryOptimizer:
 def _finite_difference_gradient(
     optimizer: HarmonicBoundaryOptimizer, parameters: np.ndarray, step: float = 1.0e-6
 ) -> np.ndarray:
-    directions = np.eye(4) * step
+    directions = np.eye(len(parameters)) * step
     return np.asarray(
         [
             (
@@ -45,6 +46,17 @@ def _finite_difference_gradient(
             for direction in directions
         ]
     )
+
+
+def _arc_mean(
+    optimizer: HarmonicBoundaryOptimizer,
+    field: np.ndarray,
+    start: float,
+    end: float,
+) -> float:
+    mass = optimizer._arc_mass(start, end)
+    boundary_field = field[optimizer.boundary_vertices]
+    return float(mass.sum(axis=0) @ boundary_field / mass.sum())
 
 
 def test_cyclic_arc_weights_are_exact_even_when_an_arc_wraps() -> None:
@@ -62,7 +74,7 @@ def test_cyclic_arc_weights_are_exact_even_when_an_arc_wraps() -> None:
 
 def test_robin_system_residual(optimizer: HarmonicBoundaryOptimizer) -> None:
     knots = random_knots(4, optimizer.minimum_gap)
-    field = optimizer.field_from_knots(knots)
+    field = optimizer.robin_field_from_knots(knots)
     zero_mass = optimizer._arc_mass(knots[0], knots[1])
     one_mass = optimizer._arc_mass(knots[2], knots[3])
     residual = np.asarray(cotangent_stiffness(optimizer.mesh) @ field)
@@ -71,6 +83,82 @@ def test_robin_system_residual(optimizer: HarmonicBoundaryOptimizer) -> None:
         (zero_mass + one_mass) @ boundary_field - one_mass.sum(axis=1)
     )
     np.testing.assert_allclose(residual, 0.0, rtol=0.0, atol=2.0e-12)
+
+
+def test_canonical_field_has_exact_target_arc_means_when_an_arc_wraps(
+    optimizer: HarmonicBoundaryOptimizer,
+) -> None:
+    knots = np.asarray([0.85, 1.05, 1.25, 1.45])
+    field = optimizer.field_from_knots(knots)
+    assert _arc_mean(optimizer, field, knots[0], knots[1]) == pytest.approx(
+        0.0, abs=5.0e-14
+    )
+    assert _arc_mean(optimizer, field, knots[2], knots[3]) == pytest.approx(
+        1.0, abs=5.0e-14
+    )
+
+
+def test_canonicalization_preserves_harmonicity_and_uniformity(
+    optimizer: HarmonicBoundaryOptimizer,
+) -> None:
+    knots = random_knots(5, optimizer.minimum_gap)
+    robin_field = optimizer.robin_field_from_knots(knots)
+    field, boundary_statistics = optimizer.field_and_boundary_statistics_from_knots(
+        knots
+    )
+    np.testing.assert_allclose(
+        field,
+        (robin_field - boundary_statistics.raw_zero_mean)
+        / boundary_statistics.raw_span,
+        rtol=0.0,
+        atol=2.0e-15,
+    )
+    residual = cotangent_stiffness(optimizer.mesh) @ field
+    np.testing.assert_allclose(
+        residual[optimizer.interior_vertices], 0.0, rtol=0.0, atol=5.0e-13
+    )
+    robin_loss, _ = optimizer._uniformity_loss_and_gradient(robin_field)
+    canonical_loss, _ = optimizer._uniformity_loss_and_gradient(field)
+    assert canonical_loss == pytest.approx(robin_loss, rel=2.0e-14)
+
+    robin_boundary = robin_field[optimizer.boundary_vertices]
+    canonical_boundary = field[optimizer.boundary_vertices]
+    zero_mass = optimizer._arc_mass(knots[0], knots[1])
+    one_mass = optimizer._arc_mass(knots[2], knots[3])
+    zero_target_rms = np.sqrt(
+        robin_boundary @ (zero_mass @ robin_boundary) / zero_mass.sum()
+    )
+    one_residual = robin_boundary - 1.0
+    one_target_rms = np.sqrt(one_residual @ (one_mass @ one_residual) / one_mass.sum())
+    zero_shape_rms = np.sqrt(
+        canonical_boundary @ (zero_mass @ canonical_boundary) / zero_mass.sum()
+    )
+    canonical_one_residual = canonical_boundary - 1.0
+    one_shape_rms = np.sqrt(
+        canonical_one_residual @ (one_mass @ canonical_one_residual) / one_mass.sum()
+    )
+    assert boundary_statistics.raw_zero_target_rms == pytest.approx(zero_target_rms)
+    assert boundary_statistics.raw_one_target_rms == pytest.approx(one_target_rms)
+    assert boundary_statistics.canonical_zero_target_rms == pytest.approx(
+        zero_shape_rms
+    )
+    assert boundary_statistics.canonical_one_target_rms == pytest.approx(one_shape_rms)
+
+
+@pytest.mark.parametrize("case", ["constant", "tiny", "negative"])
+def test_canonicalization_rejects_a_field_without_stable_positive_span(
+    optimizer: HarmonicBoundaryOptimizer,
+    case: str,
+) -> None:
+    knots = random_knots(6, optimizer.minimum_gap)
+    baseline = optimizer.robin_field_from_knots(knots)
+    fields = {
+        "constant": np.ones(len(optimizer.mesh.vertices)),
+        "tiny": 0.5 + 1.0e-12 * (baseline - 0.5),
+        "negative": -baseline,
+    }
+    with pytest.raises(ValueError, match="mean span is too small"):
+        optimizer._canonicalize_field(fields[case], knots)
 
 
 def test_moving_arc_mass_derivative_is_continuous_at_a_vertex(
@@ -172,7 +260,7 @@ def test_mesh_without_interior_vertices_uses_boundary_system() -> None:
         np.asarray([[0, 1, 2], [0, 2, 3]]),
     )
     optimizer = HarmonicBoundaryOptimizer(mesh)
-    parameters = parameters_from_knots(random_knots(2), optimizer.minimum_gap)
+    parameters = parameters_from_knots(random_knots(2))
     loss, gradient = optimizer.loss_and_gradient(parameters)
 
     assert len(optimizer.interior_vertices) == 0
@@ -193,13 +281,96 @@ def test_loss_plot_handles_zero_and_constant_histories() -> None:
         chart_svg([], title="empty", themed=False)
 
 
+def test_loss_plot_reads_recorded_state_history(tmp_path: Path) -> None:
+    history = tmp_path / "history.csv"
+    history.write_text("seed,recorded_state,loss\n0,1,0.5\n0,0,1.0\n", encoding="utf-8")
+    assert read_histories(history) == {0: [1.0, 0.5]}
+
+
 def test_zero_minimum_gap_is_rejected_consistently() -> None:
     with pytest.raises(ValueError, match="minimum_gap"):
         random_knots(0, minimum_gap=0.0)
     with pytest.raises(ValueError, match="minimum_gap"):
-        knots_from_parameters(np.zeros(4), minimum_gap=0.0)
-    with pytest.raises(ValueError, match="minimum_gap"):
-        parameters_from_knots(np.asarray([0.0, 0.2, 0.5, 0.8]), minimum_gap=0.0)
+        HarmonicBoundaryOptimizer(
+            load_obj(ROOT / "data" / "plane.obj"), minimum_gap=0.0
+        )
+
+
+def test_target_arc_width_accepts_exactly_the_feasible_interval(
+    optimizer: HarmonicBoundaryOptimizer,
+) -> None:
+    for target in (0.1, 0.4):
+        configured = HarmonicBoundaryOptimizer(
+            optimizer.mesh,
+            minimum_gap=0.1,
+            target_arc_width=target,
+            width_weight=1.0,
+        )
+        assert configured.target_arc_width == target
+    for target in (0.099, 0.401):
+        with pytest.raises(ValueError, match="target_arc_width"):
+            HarmonicBoundaryOptimizer(
+                optimizer.mesh,
+                minimum_gap=0.1,
+                target_arc_width=target,
+                width_weight=1.0,
+            )
+
+
+def test_direct_gap_parameters_and_jacobian() -> None:
+    knots = random_knots(3)
+    parameters = parameters_from_knots(knots)
+    recovered, jacobian, gaps = knots_from_parameters(parameters)
+    np.testing.assert_allclose(recovered, knots, rtol=0.0, atol=2.0e-16)
+    np.testing.assert_allclose(gaps.sum(), 1.0, rtol=0.0, atol=2.0e-16)
+    step = 1.0e-7
+    finite_difference = np.column_stack(
+        [
+            (
+                knots_from_parameters(parameters + step * direction)[0]
+                - knots_from_parameters(parameters - step * direction)[0]
+            )
+            / (2.0 * step)
+            for direction in np.eye(5)
+        ]
+    )
+    np.testing.assert_allclose(jacobian, finite_difference, rtol=2.0e-9, atol=2.0e-9)
+
+
+def test_gap_kkt_residual_understands_an_active_lower_bound() -> None:
+    minimum_gap = 0.03
+    gaps = np.asarray([minimum_gap, 0.3, 0.3, 0.37])
+    assert (
+        _gap_kkt_residual(np.asarray([0.0, 1.0, 0.0, 0.0, 0.0]), gaps, minimum_gap)
+        == 0.0
+    )
+    assert _gap_kkt_residual(
+        np.asarray([0.0, -1.0, 0.0, 0.0, 0.0]), gaps, minimum_gap
+    ) == pytest.approx(1.0)
+
+
+def test_gap_kkt_residual_does_not_hide_near_bound_interior_gradients() -> None:
+    gaps = np.asarray([0.030000005, 0.3, 0.3, 0.369999995])
+    residual = _gap_kkt_residual(np.asarray([0.0, 100.0, 0.0, 0.0, 0.0]), gaps, 0.03)
+    assert residual == pytest.approx(75.0)
+
+    near_quarter = np.full(4, 0.25)
+    residual = _gap_kkt_residual(
+        np.asarray([0.0, 1.0, 2.0, 3.0, 4.0]),
+        near_quarter,
+        0.249999999,
+    )
+    assert residual == pytest.approx(1.5)
+
+
+def test_small_minimum_gap_keeps_slsqp_trial_fields_valid() -> None:
+    optimizer = HarmonicBoundaryOptimizer(
+        load_obj(ROOT / "data" / "disk.obj"), minimum_gap=1.0e-6
+    )
+    result = optimizer.optimize(
+        random_knots(0, minimum_gap=optimizer.minimum_gap), max_iterations=5
+    )
+    assert np.isfinite(result.field).all()
 
 
 def test_zero_initial_loss_has_finite_relative_reduction() -> None:
@@ -219,8 +390,8 @@ def test_cotangent_energy_matches_face_gradient_energy(
     assert stiffness_energy == pytest.approx(gradient_energy, rel=2.0e-12)
 
 
-def test_full_four_parameter_gradient(optimizer: HarmonicBoundaryOptimizer) -> None:
-    parameters = parameters_from_knots(random_knots(7), optimizer.minimum_gap)
+def test_full_five_coordinate_gradient(optimizer: HarmonicBoundaryOptimizer) -> None:
+    parameters = parameters_from_knots(random_knots(7))
     _, gradient = optimizer.loss_and_gradient(parameters)
     finite_difference = _finite_difference_gradient(optimizer, parameters)
     np.testing.assert_allclose(gradient, finite_difference, rtol=2.0e-5, atol=2.0e-7)
@@ -270,6 +441,8 @@ def test_plane_corner_arcs_produce_affine_field() -> None:
         (result.knots[:, None] - knots[None, :] + 0.5) % 1.0 - 0.5
     )
     assert result.final_loss < 1.0e-10
+    assert result.success
+    assert result.kkt_residual <= 1.0e-5
     assert np.all(endpoint_distances.min(axis=1) < 1.0e-5)
 
 
@@ -280,11 +453,10 @@ def test_optimization_decreases_loss(optimizer: HarmonicBoundaryOptimizer) -> No
     assert result.final_loss < result.initial_loss
     assert result.history[0] == pytest.approx(result.initial_loss)
     assert result.history[-1] == pytest.approx(result.final_loss)
-    assert result.parameter_history.shape == (len(result.history), 4)
-    assert len(result.history) == result.iterations + 1
+    assert result.parameter_history.shape == (len(result.history), 5)
     np.testing.assert_allclose(
         result.parameter_history[0],
-        parameters_from_knots(initial_knots, optimizer.minimum_gap),
+        parameters_from_knots(initial_knots),
         rtol=0.0,
         atol=0.0,
     )
@@ -293,8 +465,43 @@ def test_optimization_decreases_loss(optimizer: HarmonicBoundaryOptimizer) -> No
     )
     for parameters, loss in zip(result.parameter_history, result.history):
         assert optimizer.loss_and_gradient(parameters)[0] == pytest.approx(loss)
-    assert np.all(np.diff(result.history) <= 1.0e-10)
+    assert np.all(result.gaps >= optimizer.minimum_gap - 1.0e-10)
+    assert result.constraint_violation <= 1.0e-10
+    assert result.statistics.gradient_cv > 0.0
     assert result.statistics.spacing_cv > 0.0
+    np.testing.assert_allclose(
+        result.field, optimizer.field_from_knots(result.knots), rtol=0.0, atol=0.0
+    )
+    np.testing.assert_allclose(
+        result.raw_field,
+        optimizer.robin_field_from_knots(result.knots),
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert result.boundary_statistics.raw_span > 0.0
+
+    norms = np.linalg.norm(optimizer._face_gradients(result.field), axis=1)
+    gradient_mean = float(optimizer._face_weights @ norms)
+    gradient_cv = (
+        np.sqrt(optimizer._face_weights @ (norms - gradient_mean) ** 2) / gradient_mean
+    )
+    spacings = 1.0 / norms
+    spacing_mean = float(optimizer._face_weights @ spacings)
+    spacing_cv = (
+        np.sqrt(optimizer._face_weights @ (spacings - spacing_mean) ** 2) / spacing_mean
+    )
+    assert result.statistics.gradient_cv == pytest.approx(gradient_cv)
+    assert result.statistics.spacing_cv == pytest.approx(spacing_cv)
+
+
+def test_zero_gradient_field_reports_infinite_spacing_cv(
+    optimizer: HarmonicBoundaryOptimizer,
+) -> None:
+    statistics = optimizer._field_statistics(
+        np.zeros(len(optimizer.mesh.vertices), dtype=np.float64)
+    )
+    assert statistics.gradient_cv == 0.0
+    assert statistics.spacing_cv == np.inf
 
 
 def test_optimization_handles_curved_mesh() -> None:
@@ -303,12 +510,17 @@ def test_optimization_handles_curved_mesh() -> None:
         target_arc_width=0.1,
         width_weight=0.1,
     )
-    parameters = parameters_from_knots(random_knots(7), optimizer.minimum_gap)
+    parameters = parameters_from_knots(random_knots(7))
     _, gradient = optimizer.loss_and_gradient(parameters)
     finite_difference = _finite_difference_gradient(optimizer, parameters)
     np.testing.assert_allclose(gradient, finite_difference, rtol=5.0e-7, atol=2.0e-7)
 
     result = optimizer.optimize(random_knots(0), max_iterations=10)
     assert result.final_loss < result.initial_loss
-    assert result.field.min() >= -2.0e-3
-    assert result.field.max() <= 1.0 + 2.0e-3
+    assert np.isfinite(result.field).all()
+    assert _arc_mean(
+        optimizer, result.field, result.knots[0], result.knots[1]
+    ) == pytest.approx(0.0, abs=5.0e-13)
+    assert _arc_mean(
+        optimizer, result.field, result.knots[2], result.knots[3]
+    ) == pytest.approx(1.0, abs=5.0e-13)

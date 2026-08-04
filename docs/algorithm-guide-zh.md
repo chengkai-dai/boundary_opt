@@ -1,10 +1,10 @@
 # 从圆盘边界的四个点，到均匀的调和场
 
-这是一篇从零开始的教程。你不需要预先懂偏微分方程、有限元、伴随法或 L-BFGS。读完后，你应该能回答四个问题：
+这是一篇从零开始的教程。你不需要预先懂偏微分方程、有限元、伴随法或约束优化。读完后，你应该能回答四个问题：
 
 1. 我们到底在优化什么？
 2. 给定四个任意的合法边界端点，场是怎样算出来的？
-3. 为什么整条计算链可以对四个参数求导？
+3. 为什么整条计算链可以对四个物理端点自由度求导？
 4. 为什么 Plane 的最优端点是四个角，而 Disk 通常只能到一个非零 loss？
 
 本文始终用 Disk 作主例子。蓝色边界弧的目标值是 0，红色边界弧的目标值是 1，灰色边界是自由边界。
@@ -15,7 +15,7 @@
 
 ## 1. 先用一句话说清任务
 
-我们有一张带边界的三角网格，想在它上面生成一个从 0 平滑过渡到 1 的标量场。边界上只有两段弧被指定目标值，另外两段保持自由。算法移动四个弧端点，使整个网格上的场尽可能“匀速变化”。
+我们有一张带边界的三角网格。系统先用两段 0/1 Robin target 弧求出 latent harmonic field $u$，再根据这两段弧的精确均值做 affine calibration，输出 canonical field $\hat u$。算法移动四个弧端点，使场的局部变化速度尽可能均匀。
 
 ![调和场与四个端点的直觉图](figures/harmonic-boundary-intuition-ai.png)
 
@@ -25,15 +25,16 @@
 
 ```mermaid
 flowchart LR
-    P["4 个无约束参数"] --> G["4 个有最小间距的 gaps"]
+    P["origin + 4 个直接 gaps"] --> G["simplex：4 个 gaps 的和为 1"]
     G --> K["4 个有序边界端点"]
     K --> Q["两段边界积分 Q₀、Q₁"]
-    Q --> B["解边界场 u_B"]
+    Q --> B["解 latent 边界场 u_B"]
     B --> U["harmonic lift：u = E u_B"]
+    U --> C["弧均值 μ₀、μ₁ → canonical û"]
     U --> L["计算均匀性 loss"]
     L --> A["伴随方程"]
-    A --> D["4 维精确梯度"]
-    D --> O["L-BFGS 更新参数"]
+    A --> D["5 坐标精确梯度；4 个可行自由度"]
+    D --> O["SLSQP 在 simplex 上更新"]
     O --> P
 ```
 
@@ -61,38 +62,38 @@ Disk 数据里有：
 
 ### 2.2 标量场
 
-给每个顶点放一个实数，就得到一个标量场：
+线性系统直接求出的 latent 场记作：
 
 $$
 u=(u_1,u_2,\ldots,u_V)^T.
 $$
 
-可以把 $u$ 想成温度、高度或电势：
+最终显示和使用的场是校准后的 $\hat u$。可以把它想成温度、高度或电势：
 
 - 紫色接近 0；
 - 黄色接近 1；
 - 中间颜色是 0 和 1 之间的过渡。
 
-在每个三角形内部，P1 有限元用三个顶点值做线性插值。因此：
+下面这些 P1 性质对 latent $u$ 和 canonical $\hat u$ 都成立；两者只差一个全局 affine 变换。在每个三角形内部，P1 有限元用三个顶点值做线性插值。因此：
 
-- $u$ 在三角形内部是线性的；
-- 相邻三角形边界上的 $u$ 连续；
-- 每个三角形里的空间梯度 $\nabla u$ 是常向量。
+- $u$ 与 $\hat u$ 在三角形内部都是线性的；
+- 相邻三角形边界上的场连续；
+- 每个三角形里的空间梯度 $\nabla u$ 与 $\nabla\hat u$ 都是常向量。
 
 ### 2.3 梯度
 
-$\nabla u$ 回答两个问题：
+$\nabla\hat u$ 回答两个问题：
 
-- 朝哪个方向，$u$ 增长最快？
-- 每走一单位距离，$u$ 大约改变多少？
+- 朝哪个方向，$\hat u$ 增长最快？
+- 每走一单位距离，$\hat u$ 大约改变多少？
 
-它的长度 $|\nabla u|$ 越大，颜色变化越快，等值线越密。相邻等值线的数值差固定为 $\Delta u$ 时，几何间距近似为
+它的长度 $|\nabla \hat u|$ 越大，颜色变化越快，等值线越密。相邻等值线的数值差固定为 $\delta_{\mathrm{level}}$ 时，P1 三角形内的法向几何间距为
 
 $$
-\Delta d \approx \frac{\Delta u}{|\nabla u|}.
+\delta d = \frac{\delta_{\mathrm{level}}}{|\nabla \hat u|}.
 $$
 
-所以，如果每个三角形的 $|\nabla u|$ 相近，等值线间距就会更均匀。
+所以，如果每个三角形的 $|\nabla \hat u|$ 相近，局部等值线间距就会更均匀。跨越多个三角形的有限距离还会受到等值线对应关系、方向和拓扑影响，因此代码里的 uniformity loss 是局部可微 surrogate，不是直接抽取等值线再量距离。
 
 ![均匀性 loss 的几何直觉](figures/loss-uniformity.svg)
 
@@ -100,8 +101,8 @@ $$
 
 注意两个不同的“梯度”：
 
-- $\nabla u$：场在网格表面上的空间梯度，是一个三维向量；
-- $\nabla_\theta L$：loss 对四个优化参数的梯度，是一个四维向量。
+- $\nabla\hat u$：场在网格表面上的空间梯度，是一个三维向量；
+- $\nabla_\theta L$：loss 对存储参数的梯度，是一个五维向量；simplex 等式去掉一个方向后，实际只有四个可行自由度。
 
 它们名字相似，但不是同一个东西。
 
@@ -117,7 +118,7 @@ $$
 
 这样的 $u$ 叫调和场。直觉上，它不会凭空制造尖峰或凹坑，而是在边界条件允许的范围内尽量平滑。
 
-同一个事实还可以用能量来表达：在给定相应边界条件的允许函数集合内，调和场最小化 Dirichlet 能量：
+在边界值被固定的 Dirichlet 问题里，内部的调和场也可以描述为：在所有具有该固定 boundary trace 的函数中，它最小化 Dirichlet 能量
 
 $$
 E_{\mathrm{smooth}}(u)
@@ -125,7 +126,7 @@ E_{\mathrm{smooth}}(u)
 \frac12\int_{\mathcal M}|\nabla u|^2\,dA.
 $$
 
-如果完全不施加任何边界作用，单独最小化这个能量只会得到任意常数场。当前实现真正最小化的是第 5 节写出的“Dirichlet 能量 + 两段 Robin 边界能量”。
+Robin 问题不是把 boundary trace 固定在一个允许集合里。当前实现真正最小化的是第 5 节写出的“Dirichlet 能量 + 两段 Robin 边界能量”；如果完全不施加任何边界作用，单独最小化 Dirichlet 能量只会得到任意常数场。
 
 这很像一张有弹性的膜：边界怎样拉住它，内部就自动找到最省能量的形状。这里的“膜高度”不是网格的真实几何高度，而是标量值 $u$。
 
@@ -586,6 +587,8 @@ $$
 
 严谨地说，它一般不是 $C^\infty$：P1 基函数的斜率会在顶点处改变，因此二阶导数可能跳变。本文所说的“完全可微”是工程语境下的端到端一阶可微，不是“任意阶都光滑”。
 
+这里的一阶可微对象是“合法端点 $\to$ PDE 场 $\to$ loss”。SLSQP 是调用这些导数寻找端点的数值算法；当前代码没有对整个迭代过程或最终 <code>argmin</code> 再做自动微分。特别是 active gap 集合发生改变时，最优解对更外层参数的映射本来就可能不光滑。
+
 ### 6.4 完整线性系统
 
 令
@@ -720,13 +723,13 @@ $$
 定义面积加权平均平方梯度
 
 $$
-\mu=\sum_f w_f q_f
+\bar q=\sum_f w_f q_f
 $$
 
 以及归一化平方梯度
 
 $$
-z_f=\frac{q_f}{\mu}.
+z_f=\frac{q_f}{\bar q}.
 $$
 
 最终均匀性 loss 是
@@ -744,47 +747,116 @@ $$
 $$
 L_{\mathrm{uniform}}
 =
-\frac{\operatorname{Var}_w(q)}{\mu^2}.
+\frac{\operatorname{Var}_w(q)}{\bar q^2}.
 $$
 
 因此：
 
 - $L=0$：每个三角形的平方梯度都相同；
 - $L$ 大：有些地方变化很快，有些地方几乎不变；
-- 因为除以 $\mu$，把整个场统一放大不会改变 loss；
+- 对任意 $a\ne0,b$，都有 $L_{\mathrm{uniform}}(au+b)=L_{\mathrm{uniform}}(u)$；
 - 大三角形按面积获得更大权重，不会让密集采样区凭空支配目标。
 
-代码输出里的 <code>spacing_cv</code> 是 $|\nabla u|$ 的变异系数，只是一个诊断量；优化的 loss 是 $|\nabla u|^2$ 的变异系数平方。两者不能混为一个指标。
+这里必须非常准确：这个 loss 只评价**相对梯度均匀性**，不固定场的 offset，也不固定从 0 到 1 的实际跨度。它和等值线间距有关，但不是直接的 spacing loss。令 $r_f=|\nabla u_f|$，局部间距正比于 $1/r_f$；当前 loss 是 $\operatorname{CV}_w^2(r_f^2)$。二者在 $r_f>0$ 时有相同的理想零点，但远离零点时可能给不同设计排序。
+
+代码因此分别报告：
+
+- <code>gradient_cv</code>：$\operatorname{CV}_w(|\nabla\hat u|)$；
+- <code>spacing_cv</code>：$\operatorname{CV}_w(1/|\nabla\hat u|)$，这才是 P1 局部等值线间距的直接诊断；
+- <code>uniformity_loss</code>：优化实际使用的 $\operatorname{CV}_w^2(|\nabla u|^2)$。
+
+三者不能混为同一个数字。若某个三角形的梯度严格为零，局部 spacing 是无穷，<code>spacing_cv</code> 也报告为无穷，而不是掩盖它。
+
+### 8.1 如何把“从 0 到 1”完整写进算法？
+
+先区分两个场：
+
+- $u$ 是 Robin 线性系统直接解出的 latent field；
+- $\hat u$ 是用户最终得到的 canonical field。
+
+使用两段目标弧的精确质量矩阵定义
+
+$$
+\ell_c=\mathbf1^TQ_c\mathbf1,
+\qquad
+\mu_c=\frac{\mathbf1^TQ_cu_B}{\ell_c},
+\qquad
+\Delta=\mu_1-\mu_0.
+$$
+
+然后固定 affine gauge：
+
+$$
+\boxed{
+\hat u=\frac{u-\mu_0}{\Delta}
+}.
+$$
+
+于是按构造精确满足
+
+$$
+\frac{1}{\ell_0}\int_{\Gamma_0}\hat u\,ds=0,
+\qquad
+\frac{1}{\ell_1}\int_{\Gamma_1}\hat u\,ds=1.
+$$
+
+仿射变换保持 harmonic 性，并且
+
+$$
+L_{\mathrm{uniform}}(\hat u)=L_{\mathrm{uniform}}(u).
+$$
+
+所以代码可以继续在数值条件更直接的 latent $u$ 上计算 loss 和伴随梯度，同时把 $\hat u$ 作为明确的公开输出。需要区分：raw $u$ 是原来 0/1 Robin 边值问题的解；$\hat u$ 是它的 affine 后处理，仍满足内部 Laplace 方程和自由弧上的齐次 Neumann 条件，但 target 弧上的 Robin rails 也被同一个 affine 变换改写了，因此它不再满足原来的 0/1 Robin 条件。只要 $\Delta>0$ 且没有小到数值不可辨认，这个 calibration 完全可微；代码不会使用 <code>max(span, eps)</code> 偷偷掩盖坏场，而是对过小或反向 span 明确报错。
+
+有限 Robin 强度下，raw $u$ 通常不精确达到 target。代码额外报告
+
+$$
+R_0=\sqrt{\frac{u_B^TQ_0u_B}{\ell_0}},
+\qquad
+R_1=\sqrt{\frac{(u_B-\mathbf1)^TQ_1(u_B-\mathbf1)}{\ell_1}},
+$$
+
+也就是两条弧各自的 raw target RMS。代码还直接在 canonical 场上积分
+
+$$
+\hat R_0=\sqrt{\frac{\hat u_B^TQ_0\hat u_B}{\ell_0}},
+\qquad
+\hat R_1=\sqrt{\frac{(\hat u_B-\mathbf1)^TQ_1(\hat u_B-\mathbf1)}{\ell_1}},
+$$
+
+分别通过 <code>raw_*_target_rms</code> 和 <code>canonical_*_target_rms</code> 报告。它们和 $\Delta$ 是质量诊断，不会默认以任意权重混入 uniformity loss。校准保证的是两条弧的**均值**为 0 和 1；$\hat u$ 仍可能轻微 overshoot，也不保证弧上每个点严格等于 target。
 
 ### loss 对场的导数
 
 如果你只想使用算法，可以跳过这一小节。为了说明它真的可微，定义
 
 $$
-m_2=\sum_f w_fz_f^2=L+1.
+m_2=\sum_f w_fz_f^2=L_{\mathrm{uniform}}+1.
 $$
 
 则
 
 $$
-\frac{\partial L}{\partial q_f}
+\frac{\partial L_{\mathrm{uniform}}}{\partial q_f}
 =
-\frac{2w_f}{\mu}(z_f-m_2),
+\frac{2w_f}{\bar q}(z_f-m_2),
 $$
 
 又因为 $q_f=g_f^Tg_f$，
 
 $$
-\frac{\partial L}{\partial g_f}
+\frac{\partial L_{\mathrm{uniform}}}{\partial g_f}
 =
-\frac{4w_f}{\mu}(z_f-m_2)g_f.
+\frac{4w_f}{\bar q}(z_f-m_2)g_f.
 $$
 
 通过每个三角形的 P1 gradient basis，可以把这些局部导数汇总成
 
 $$
-r=\frac{\partial L}{\partial u}.
+r=\frac{\partial L_{\mathrm{uniform}}}{\partial u}.
 $$
+
+可选的 width prior 不依赖场 $u$，所以不会出现在这一段场导数里；它对端点的显式导数会在第 11 节所述的总 knot gradient 中另行相加。
 
 ---
 
@@ -822,7 +894,7 @@ $$
 dL=p_B^T(db-dA\,u_B)
 $$
 
-直接得到四个端点导数：
+直接得到 uniformity 项的四个端点导数：
 
 $$
 \begin{aligned}
@@ -837,14 +909,14 @@ $$
 \end{aligned}
 $$
 
-这里的 $u(k_i)$ 和 $p(k_i)$ 是用连续的边界 P1 基函数在端点处评价的。仍然要强调：这是评价有限元函数，不是给自由边界插值一个人为的 boundary condition。
+这里的 $u(k_i)$ 和 $p(k_i)$ 是用连续的边界 P1 基函数在端点处评价的。仍然要强调：这是评价有限元函数，不是给自由边界插值一个人为的 boundary condition。若启用了 width prior，总 knot gradient 还要加上 <code>_width_loss_and_knot_gradient</code> 给出的显式项。
 
 一次 objective evaluation 的核心成本因此是：
 
 1. 一次边界 Cholesky factorization；
 2. 一次前向 backsolve 得到 $u_B$；
 3. 一次伴随 backsolve 得到 $p_B$；
-4. 四个端点处的局部取值和四维梯度组装。
+4. 四个端点处的局部取值和 knot 梯度组装。
 
 ---
 
@@ -852,28 +924,16 @@ $$
 
 直接优化 $k_0,k_1,k_2,k_3$ 很麻烦：优化器可能让两个端点穿过彼此，甚至把某段弧压成零长度。
 
-当前实现改为优化
+当前实现直接优化
 
 $$
-\theta=(o,\eta_0,\eta_1,\eta_2).
+\theta=(o,g_0,g_1,g_2,g_3),
 $$
 
-$o$ 是起点，另外三个量和一个固定为 0 的 logit 一起进入 softmax。为避免和上一节的 adjoint $p_B$ 混淆，这里把 softmax 概率记作 $\pi$：
+$o$ 是整个布局沿边界循环移动的原点，四个 gap 全部显式存储，并直接位于 shifted simplex：
 
 $$
-\pi=\operatorname{softmax}(\eta_0,\eta_1,\eta_2,0).
-$$
-
-给定最小间距 $\varepsilon$，四段 gap 定义为
-
-$$
-g_i=\varepsilon+(1-4\varepsilon)\pi_i.
-$$
-
-因此自动满足
-
-$$
-g_i>\varepsilon,
+g_i\ge\varepsilon,
 \qquad
 \sum_{i=0}^3g_i=1.
 $$
@@ -889,17 +949,43 @@ k_3&=o+g_0+g_1+g_2.
 \end{aligned}
 $$
 
-默认 $\varepsilon=0.03$。无论 L-BFGS 怎样更新 $\theta$，四个端点都保持循环有序，每段都不会消失。链式法则再把
+因此代码存储 5 个坐标，但等式 $\sum g_i=1$ 去掉一个方向，真正的可行自由度仍是 4。默认 $\varepsilon=0.03$。SLSQP 直接处理四个下界和一个线性等式，因此能够真正达到 active bound $g_i=\varepsilon$，不需要让 softmax logit 趋向无穷。
+
+SLSQP 偶尔会在一次 line-search 试算中给出尚未精确满足等式的正 gaps。为保证这些临时求值也对应合法闭环，代码在 objective 内使用
+
+$$
+\tilde g_i=\frac{g_i}{s},
+\qquad
+s=\sum_jg_j,
+\qquad
+\frac{\partial\tilde g_i}{\partial g_j}
+=\frac{\delta_{ij}s-g_i}{s^2}.
+$$
+
+在可行 simplex 上 $s=1$，所以 $\tilde g=g$，目标函数本身完全没有被改变。对满足 $\sum_i\delta g_i=0$ 的可行切向扰动，也有 $\delta\tilde g=\delta g$；此时 knot 的微分就是简单的累加：
+
+$$
+\begin{aligned}
+\delta k_0&=\delta o,\\
+\delta k_1&=\delta o+\delta g_0,\\
+\delta k_2&=\delta o+\delta g_0+\delta g_1,\\
+\delta k_3&=\delta o+\delta g_0+\delta g_1+\delta g_2.
+\end{aligned}
+$$
+
+代码把上面的 normalization Jacobian 与 cumulative-sum Jacobian 相乘，再用链式法则把
 
 $$
 \frac{\partial L}{\partial k}
 $$
 
-乘以 knot Jacobian，得到优化器真正需要的
+变成优化器需要的五坐标梯度
 
 $$
 \frac{\partial L}{\partial\theta}.
 $$
+
+这种写法在可行 simplex 上保证端点顺序和最小间距；off-simplex retraction 则保证临时 trial 仍有正的、有序且闭合的四个 gaps。同时它避免了 gap 接近下界时 softmax Jacobian 消失的问题。$o$ 保持无界且只在求值时按周期取模，避免在 $0/1$ 接缝制造人工约束。
 
 ---
 
@@ -933,32 +1019,48 @@ $$
 
 ---
 
-## 12. L-BFGS 在做什么？它能找到 local minimum 吗？
+## 12. SLSQP 在做什么？它能找到 local minimum 吗？
 
-L-BFGS 每轮拿到两个东西：
+SLSQP 每轮拿到：
 
 - 当前 loss $L(\theta)$；
-- 当前四维梯度 $\nabla_\theta L$。
+- 当前五坐标梯度 $\nabla_\theta L$；
+- 四个 gap 下界和一个线性等式。
 
-它用最近若干轮的参数与梯度变化近似曲率，再通过 line search 选择步长。它通常比固定学习率的梯度下降或 Adam 更适合这种“小维度、平滑、每次求值较贵”的确定性问题。
+它在每个 major iteration 里构造一个局部二次子问题，同时考虑下降方向和 simplex 可行性。五个存储坐标减去一个等式后只有四个自由度，线性约束的额外成本很小，而且 active minimum gap 可以被精确表达。
 
 ![Disk 的八个随机初值 loss 曲线](figures/disk-loss-history.svg)
 
-*当前实现计算结果：Disk，8 个随机初值，纵轴为对数刻度，粗线是逐 accepted iteration 的中位数。*
+*当前实现计算结果：Disk，8 个随机初值，纵轴为对数刻度，粗线是逐 recorded optimizer state 的中位数。history 包含初值、callback 状态和最终状态，不假设其数量严格等于 <code>nit+1</code>。*
 
 这张图说明两件事：
 
-1. loss 通常下降，但不必匀速下降；line search 可能经历平台后突然找到更好的方向；
+1. major iterates 的 loss 不保证严格单调，约束优化器有时会先改善可行性或局部模型；
 2. 不同初值的终点略有不同，说明问题是非凸的。
 
 所以答案是：
 
-- L-BFGS 能在常规条件下收敛到一个 stationary point，实践中通常是 local minimum；
+- SLSQP 能在常规条件下收敛到满足 KKT 条件的局部 stationary point；
 - 它不能保证找到 global minimum；
-- 最稳妥的做法是随机多个 seed，比较最终 loss，并检查梯度范数和几何结果；
-- 对只有四个参数的问题，multistart 很便宜，也很自然。
+- 最稳妥的做法是随机多个 seed，比较最终 loss，并检查 constraint violation、KKT residual 和几何结果；
+- 对只有四个可行自由度的问题，multistart 很便宜，也很自然。
 
-Adam 并不会自动把非凸问题变成全局优化。这里没有随机 mini-batch，梯度也很精确，Adam 的噪声适应优势不明显；L-BFGS 的 line search 和曲率信息通常更合适。
+在 active constraint 上，普通梯度范数不必为零，因为约束反力会平衡梯度。因此代码不再把 <code>norm(result.jac)</code> 当作成功标准，而是报告：
+
+- <code>constraint_violation</code>：最终 gaps 对 simplex 的违反量；
+- <code>kkt_residual</code>：free gaps 的梯度是否相等、active gaps 的梯度符号是否正确，以及循环平移方向是否 stationary。
+
+当前代码用 seeds 0–15、每次最多 100 个 major iterations 得到：
+
+| 模型 | KKT/约束审计成功 | 主 basin | best / median / max final loss |
+|---|---:|---:|---:|
+| Plane | 16/16 | 15/16 到四角零-loss basin | $6.16\times10^{-14}$ / $8.64\times10^{-14}$ / $0.562313$ |
+| Disk | 16/16 | 结果形成一簇 | $0.237119$ / $0.245503$ / $0.258962$ |
+| Triple Peak | 16/16 | 15/16 到约 $0.3505$ basin | $0.350497$ / $0.350633$ / $1.428840$ |
+
+Plane 与 Triple Peak 各有一个 run 停在明显更差、但仍满足 KKT 的 basin。这正好说明 <code>success=True</code> 表示“约束局部求解成功”，不表示“找到了全局最优”。
+
+Adam 并不会自动把非凸问题变成全局优化，也不能原生处理这里的闭 simplex。当前问题没有 stochastic mini-batch，使用解析梯度的低维约束优化更直接。
 
 ---
 
@@ -968,7 +1070,7 @@ Adam 并不会自动把非凸问题变成全局优化。这里没有随机 mini-
 
 ![Disk 优化前后](figures/disk-before-after.png)
 
-*当前实现计算结果：左侧明确是初始状态，右侧是优化后状态。蓝色为目标 0，红色为目标 1，灰色为自由边界。*
+*当前实现计算结果：左侧明确是初始状态，右侧是优化后状态。颜色显示 canonical $\hat u$；蓝色为 latent Robin target 0，红色为 target 1，灰色为自由边界。*
 
 参数为：
 
@@ -981,14 +1083,26 @@ $$
 结果为：
 
 - 初始 loss：$15.684301$；
-- 最终 loss：$0.240472$；
-- accepted L-BFGS iterations：57；
-- objective evaluations：134；
+- 最终 loss：$0.252757$；
+- SLSQP major iterations：26；
+- objective evaluations：52；
 - 最终四段 gaps：
 
 $$
-(0.256161,\ 0.224899,\ 0.271426,\ 0.247514).
+(0.249783,\ 0.247017,\ 0.237381,\ 0.265818).
 $$
+
+raw Robin 场的两条目标弧均值和 span 是
+
+$$
+\mu_0=0.03543,
+\qquad
+\mu_1=0.96272,
+\qquad
+\Delta=0.92729.
+$$
+
+两侧 raw target RMS 分别为 $3.91\%$ 和 $4.09\%$。校准后两条弧均值精确为 0 和 1，完整 canonical 场范围约为 $[-0.0129,1.0134]$；这展示了“均值精确校准”和“允许轻微 overshoot”的区别。
 
 你可以从图上直接读到 loss 的几何含义：
 
@@ -996,13 +1110,15 @@ $$
 - 优化后等值线大体平行、间距更均匀；
 - Disk 的圆形边界法向不断变化，再加上 Robin/Neumann 的分段边界条件，所以最终 loss 通常不是 0。这里的原因是边界几何，不是表面曲率；当前 <code>disk.obj</code> 本身是平面网格。
 
-这也解释了为什么旧版本出现的 0.06、0.02 和当前 0.24 不能只看数字比较：如果边界离散方式、Robin/Dirichlet 模型、width prior 或 loss 定义不同，它们是在优化不同的目标。教程中的数字全部来自当前 Robin + exact arc mass + unregularized width 的实现。
+这也解释了为什么旧版本出现的 0.06、0.02 和当前 0.25 不能只看数字比较：如果边界离散方式、Robin/Dirichlet 模型、width prior 或 loss 定义不同，它们是在优化不同的目标。教程中的数字全部来自当前 Robin + exact arc mass + unregularized width + direct-simplex 实现。
+
+即使数学目标相同，也不能把某一个 seed 当成回归标准。旧的四坐标 direct-gap 写法让 Disk seed 0 到达 $0.234956$，当前循环对称的“显式四 gaps + 等式”写法到达 $0.252757$；但 16-seed 的 median 分别为 $0.244718$ 和 $0.245503$，当前写法的 worst case 反而从 $0.287756$ 改善到 $0.258962$。两种坐标在可行 simplex 上描述同一个目标，非凸 SLSQP 只是沿不同数值轨迹进入了不同 basin。当前版本保留五坐标写法，因为它对四个 gaps 对称，并且在 <code>minimum_gap=1e-6</code> 的测试中仍能稳定处理 off-simplex trial point；需要更低 loss 时应做 multistart，而不是为 seed 0 调参。
 
 ---
 
 ## 14. Plane：为什么理论最优是四个角？
 
-对一个矩形平面，如果蓝弧和红弧分别覆盖一对相对的完整边，另外两条边自由，那么存在一个仿射场，例如沿竖直方向
+对一个矩形平面，如果蓝弧和红弧分别覆盖一对相对的完整边，另外两条边自由，那么 latent Robin 解是一个仿射场，例如沿竖直方向
 
 $$
 u(x,y)=ay+b.
@@ -1016,11 +1132,19 @@ $$
 - 因此每个 $q_f=|\nabla u_f|^2$ 相同；
 - 所以 $L_{\mathrm{uniform}}=0$。
 
+有限 $\rho$ 下，$b$ 通常不严格为 0，另一侧也不严格为 1；这不影响常梯度结论。canonical calibration 后
+
+$$
+\hat u=\frac{u-\mu_0}{\mu_1-\mu_0}
+$$
+
+仍然是仿射 harmonic field，并且两条完整目标边的均值——此时也是逐点值——精确为 0 和 1。raw 与 canonical 场的 uniformity loss 都为 0。
+
 要让两段目标弧恰好覆盖上下完整边，四个端点自然落在四个角上。
 
 ![Plane 四角最优解](figures/plane-corner-optimum.png)
 
-*当前实现计算结果：seed 0 从 $11.090487$ 收敛到约 $8.7\times10^{-14}$，截图显示为 0.000000；优化后的四个端点位于四个几何角。*
+*当前实现计算结果：seed 0 从 $11.090487$ 收敛到约 $8.6\times10^{-14}$，截图显示为 0.000000；优化后的四个端点位于四个几何角。raw span 为 $0.91956$，canonical 场则覆盖 0–1。*
 
 一个容易产生误判的细节：端点参数是归一化弧长，不是平面的 $x/y$ 坐标。如果矩形不是正方形，四个角在 $s$ 上不会等间隔为 $0,0.25,0.5,0.75$。当前 Plane 的角位置按选择的边界起点和方向表示，取模后约为
 
@@ -1052,12 +1176,15 @@ Plane 是这套算法最重要的 sanity check：当前实现应能达到数值�
 | 参数 $\theta\to k,g$ | <code>knots_from_parameters</code> |
 | cotangent stiffness $K$ | <code>cotangent_stiffness</code> |
 | 三角形 $\nabla\phi_i$ | <code>face_gradient_basis</code> |
-| harmonic lift $u=Eu_B$ | <code>_harmonic_lift</code> |
+| latent harmonic lift $u=Eu_B$ | <code>_harmonic_lift</code> |
 | 精确移动弧矩阵 $Q(a,b)$ | <code>HarmonicBoundaryOptimizer._arc_mass</code> |
 | reduced system $A u_B=b$ | <code>_system_from_knots</code>、<code>_solve</code> |
+| raw Robin 场 $u$ | <code>robin_field_from_knots</code> |
+| canonical 场、弧均值、span、boundary RMS | <code>field_and_boundary_statistics_from_knots</code>、<code>BoundaryStatistics</code> |
+| canonical 场 $\hat u$ | <code>field_from_knots</code>、<code>OptimizationResult.field</code> |
 | 均匀性 loss 与 $\partial L/\partial u$ | <code>_uniformity_loss_and_gradient</code> |
 | 伴随端点梯度 | <code>loss_and_gradient</code> |
-| L-BFGS | <code>optimize</code> |
+| direct-simplex SLSQP | <code>optimize</code> |
 | 多随机种子 | <code>scan_mesh_seeds.py</code> |
 | loss 图 | <code>plot_loss_curves.py</code> |
 | Polyscope 静态图与动画 | <code>visualize_mesh_optimization.py</code> |
@@ -1083,6 +1210,8 @@ result = optimizer.optimize(
 print(result.initial_loss, result.final_loss)
 print(result.knots % 1.0)
 print(result.gaps)
+print(result.boundary_statistics)
+print(result.statistics)
 ~~~
 
 ---
@@ -1160,7 +1289,7 @@ $$
 - loss 对场的导数；
 - 伴随方程；
 - 四个端点的正负号；
-- softmax-gap Jacobian。
+- direct-gap normalization 与 cumulative-sum Jacobian。
 
 ### 17.2 端点跨顶点测试
 
@@ -1178,12 +1307,15 @@ $$
 - 仿射场；
 - 数值上接近 0 的 uniformity loss。
 
+还要验证 raw 与 canonical 场的 uniformity loss 相同、canonical 场在两条目标弧上的精确均值分别为 0 和 1，并且 calibration 后内部 harmonic residual 仍接近机器精度。
+
 ### 17.4 多 seed 与可视化
 
 优化器返回 success 不等于几何结果一定合理。还应检查：
 
 - 多个 seed 的最终 loss 分布；
-- gradient norm；
+- constraint violation 与 KKT residual；
+- raw span、两侧 target RMS、gradient CV 与 spacing CV；
 - 蓝、红、灰边界段是否与 knot 一致；
 - 等值线是否真的更均匀；
 - 左右截图是否明确标识初始与优化后。
@@ -1216,19 +1348,9 @@ $$
 |---|---:|
 | 完整场 $u$ | $2\times10^{-15}$ |
 | loss | $2\times10^{-14}$ |
-| 四维解析梯度 | $7\times10^{-12}$ |
+| 参数解析梯度 | $7\times10^{-12}$ |
 
-这些都是双精度舍入量级，不表示 PDE、loss 或导数公式发生了改变。但 L-BFGS 是一个递归的非凸优化过程：本轮梯度决定 line search 接受哪个点，接受的点又决定下一轮近似 Hessian。如果迭代恰好靠近两个 basin 的分水岭，$10^{-12}$ 级扰动也可能在若干轮后发展成完全不同的轨迹。
-
-Disk seed 0 就是一个例子：
-
-$$
-0.240305351
-\quad\longrightarrow\quad
-0.240471703.
-$$
-
-绝对差约为 $1.66\times10^{-4}$，相对差约为 $0.069\%$。两个结果是不同的浅 local minima，不是同一个线性系统被解错。
+这些都是双精度舍入量级，不表示 PDE、loss 或导数公式发生了改变。但任何递归的非凸优化器都会用本轮状态构造下一轮局部模型；如果迭代恰好靠近两个 basin 的分水岭，$10^{-12}$ 级扰动也可能在若干轮后发展成不同轨迹。direct-simplex SLSQP 同样不能消除非凸性。
 
 端点位置看起来相差很远时，还要先排除 target-swap 等价性：
 
@@ -1240,25 +1362,12 @@ $$
 
 这个变换交换目标 0 和目标 1，场随之变成 $1-u$，但 $|\nabla u|$ 和 uniformity loss 不变。Disk 还接近旋转对称，因此不同结果可以只是沿圆周转到另一个很浅的离散极小值。
 
-更有意义的是看 multistart 分布。在 100 个 Disk seeds 上，旧分块写法与 harmonic-lift 写法分别得到：
-
-| 指标 | 分块 $H$ | harmonic lift $E$ |
-|---|---:|---:|
-| median final loss | 0.250045 | 0.251065 |
-| mean final loss | 0.255216 | 0.256134 |
-| 同 seed 获得更低 loss 的次数 | 53 | 47 |
-
-两组分布没有表现出实质性能差异。因此这里应区分两个概念：
+因此这里应区分两个概念：
 
 - **方程级等价性**：同一参数处的场、loss 和梯度只差机器舍入；
 - **轨迹级复现性**：非凸优化的同一 seed 不保证在代数重排后仍走同一条迭代路径。
 
-另外两个模型的 100-seed 检查也没有显示 harmonic lift 退化：
-
-- Plane 找到 $L<10^{-8}$ 四角解的次数从 94/100 变为 97/100；
-- Triple-Peak 进入两个已知优质 basin 的次数从 99/100 变为 100/100。
-
-这些差异不应解读成 $E$ 会提高优化质量；它们同样只是 basin 选择的随机性。真正结论是两种代数写法的 multistart 性能处于同一水平。
+判断重构有没有退化时，应重新运行相同的 Plane、Disk、Triple-Peak multistart，并比较 loss 分布、KKT residual 和 coverage diagnostics，而不是要求每个 seed 逐位重现旧轨迹。
 
 内存代价也很小。旧版永久保存 $H\in\mathbb R^{I\times B}$，当前版本用 $E\in\mathbb R^{V\times B}$ 替代它，并没有同时永久保存两份矩阵。因为 $V=I+B$，增加的内存恰好是
 
@@ -1292,7 +1401,10 @@ $$
 需要知道的限制：
 
 - 它是局部优化，不保证 global minimum；
-- Robin 只是在有限 $\rho$ 下逼近硬 Dirichlet；
+- latent Robin 场在有限 $\rho$ 下只逼近 0/1 target，不保证 raw coverage；
+- canonical $\hat u$ 只保证两条目标弧的均值为 0/1，允许弧内波动和轻微 overshoot；
+- raw span $\Delta$ 太小时 affine calibration 会病态并被拒绝；
+- uniformity loss 是局部 spacing 的稳定 surrogate，不是抽取有限等值线后的直接距离 loss；
 - pipeline 通常是 $C^1$，不是 $C^\infty$；
 - 任意钝角网格上的 cotangent 离散不自动保证 discrete maximum principle；
 - dense Schur 假设边界远小于整体；
@@ -1306,21 +1418,24 @@ $$
 
 1. 从 OBJ 读取三角网格，找到唯一边界环。
 2. 用归一化弧长 $s$ 参数化边界。
-3. 用 softmax gaps 把四个无约束参数变成四个有序端点。
+3. 用 $(o,g_0,g_1,g_2,g_3)$ 存储布局，并在闭 simplex 上约束四个 gaps 的总和与最小值；等式约束后仍是四个自由度。
 4. 对蓝弧和红弧精确积分 P1 boundary mass，得到 $Q_0,Q_1$。
 5. 用预计算的 Schur complement 构造边界系统。
-6. 解一次前向方程，再用 harmonic lift $u=Eu_B$ 恢复全网格场。
+6. 解一次前向方程，再用 harmonic lift $u=Eu_B$ 恢复全网格 latent 场。
 7. 计算每个三角形的 $|\nabla u|^2$，得到面积加权均匀性 loss。
 8. 解一次伴随方程，在四个端点处评价 $u$ 和 $p$。
-9. 得到四个 knot 梯度，再通过 softmax Jacobian 变成参数梯度。
-10. L-BFGS 更新四个参数，直到收敛。
-11. 用多随机初值减少落入较差 local minimum 的风险。
+9. 得到四个 knot 梯度，再通过 normalization 与 cumulative-sum Jacobian 变成五坐标参数梯度。
+10. SLSQP 在 simplex 约束下更新五个存储坐标（四个可行自由度），直到 KKT 条件近似满足。
+11. 计算 $\mu_0,\mu_1,\Delta$ 和 boundary RMS，输出 $\hat u=(u-\mu_0)/\Delta$。
+12. 用多随机初值减少落入较差 local minimum 的风险。
 
 最值得记住的三句话：
 
 > 灰色边界不需要插值赋值；它是自然 Neumann 边界。
 
 > 可微性的核心不是把端点吸附到顶点，而是对移动弧的 P1 质量矩阵做精确积分。
+
+> uniformity loss 负责场的相对 shape；目标弧均值校准负责明确的 0–1 gauge。
 
 > Plane 的四角解来自“仿射 harmonic field 具有常梯度”，而 Disk 的圆形边界几何与分段边界条件通常让最优 loss 保持非零。
 
@@ -1343,6 +1458,9 @@ $$
 | Schur complement | 预先消掉内部未知量，只留下边界系统 |
 | harmonic lift | 用 $u=Eu_B$ 把边界值一次性延拓到完整调和场 |
 | adjoint | 用一次额外求解获得所有设计变量梯度 |
-| softmax gaps | 自动保持端点顺序和最小间距的参数化 |
-| L-BFGS | 使用梯度和少量历史曲率信息的局部优化器 |
+| latent field $u$ | 原始 Robin 线性系统直接求出的场 |
+| canonical field $\hat u$ | 用两条目标弧均值做 affine calibration 后的公开输出 |
+| span $\Delta$ | 两条目标弧 raw 均值之差，也是 calibration 的稳定性指标 |
+| simplex | 四个 gaps 均不小于下界、总和为 1 的约束空间 |
+| SLSQP | 使用梯度并显式处理线性约束的局部优化器 |
 | seed | 生成一个随机初始端点布局的编号 |

@@ -22,7 +22,7 @@ text { font-family: Inter, ui-sans-serif, system-ui, sans-serif; fill: #1f2937; 
 <text x="552" y="315" text-anchor="middle" class="small">different |∇u|</text>
 <line x1="1045" y1="120" x2="1090" y2="120" stroke="#2563eb" stroke-width="4"/><line x1="1045" y1="170" x2="1090" y2="170" stroke="#2563eb" stroke-width="4"/><line x1="1045" y1="220" x2="1090" y2="220" stroke="#2563eb" stroke-width="4"/><line x1="1045" y1="270" x2="1090" y2="270" stroke="#2563eb" stroke-width="4"/>
 <text x="1068" y="315" text-anchor="middle" class="small">equal |∇u|</text>
-<text x="550" y="425" text-anchor="middle" class="math label">L = Σf w_f (q_f / μ − 1)²,   q_f = |∇u_f|²,   μ = Σf w_f q_f</text>
-<text x="550" y="470" text-anchor="middle" class="small">L = 0 only when every triangle has the same squared gradient magnitude.</text>
+<text x="550" y="425" text-anchor="middle" class="math label">L = Σf w_f (q_f / q̄ − 1)²,   q_f = |∇u_f|²,   q̄ = Σf w_f q_f</text>
+<text x="550" y="470" text-anchor="middle" class="small">A smooth local-spacing surrogate: L = 0 exactly when every triangle has equal |∇u|.</text>
 
 </svg>

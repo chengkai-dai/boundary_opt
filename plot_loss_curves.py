@@ -30,9 +30,10 @@ def read_histories(path: Path) -> dict[int, list[float]]:
     histories: defaultdict[int, list[tuple[int, float]]] = defaultdict(list)
     with path.open(encoding="utf-8") as stream:
         for row in csv.DictReader(stream):
-            histories[int(row["seed"])].append(
-                (int(row["iteration"]), float(row["loss"]))
-            )
+            state = row.get("recorded_state", row.get("iteration"))
+            if state is None:
+                raise ValueError(f"{path} has no recorded_state column")
+            histories[int(row["seed"])].append((int(state), float(row["loss"])))
     return {
         seed: [value for _, value in sorted(points)]
         for seed, points in sorted(histories.items())
@@ -58,10 +59,10 @@ def chart_svg(
     left, right, top, bottom, gap = 66, 24, 38, 58, 58
     panel_width = (width - left - right - gap * (len(panels) - 1)) / len(panels)
     plot_height = height - top - bottom
-    maximum_iteration = max(
+    maximum_state = max(
         len(history) - 1 for _, data in panels for history in data.values()
     )
-    maximum_iteration = max(10, int(math.ceil(maximum_iteration / 10.0) * 10))
+    maximum_state = max(10, int(math.ceil(maximum_state / 10.0) * 10))
     all_values = [
         value for _, data in panels for history in data.values() for value in history
     ]
@@ -84,7 +85,7 @@ def chart_svg(
         if (value := multiplier * 10**exponent) > 0.0
     ]
     y_ticks = [value for value in candidate_ticks if lower <= value <= upper]
-    x_ticks = list(range(0, maximum_iteration + 1, 10))
+    x_ticks = list(range(0, maximum_state + 1, 10))
 
     colors = (
         {
@@ -104,12 +105,8 @@ def chart_svg(
         }
     )
 
-    def x_coordinate(iteration: int, panel: int) -> float:
-        return (
-            left
-            + panel * (panel_width + gap)
-            + panel_width * iteration / maximum_iteration
-        )
+    def x_coordinate(state: int, panel: int) -> float:
+        return left + panel * (panel_width + gap) + panel_width * state / maximum_state
 
     def y_coordinate(value: float) -> float:
         fraction = (math.log10(max(value, plot_floor)) - math.log10(lower)) / (
@@ -147,8 +144,8 @@ def chart_svg(
 
         for history in histories.values():
             points = [
-                (x_coordinate(iteration, panel), y_coordinate(value))
-                for iteration, value in enumerate(history)
+                (x_coordinate(state, panel), y_coordinate(value))
+                for state, value in enumerate(history)
             ]
             parts.append(
                 f'<polyline points="{polyline(points)}" stroke="{colors["peer"]}" stroke-opacity="0.32" stroke-width="1.2"/>'
@@ -156,14 +153,13 @@ def chart_svg(
 
         median_history = [
             median(
-                history[min(iteration, len(history) - 1)]
-                for history in histories.values()
+                history[min(state, len(history) - 1)] for history in histories.values()
             )
-            for iteration in range(maximum_iteration + 1)
+            for state in range(maximum_state + 1)
         ]
         median_points = [
-            (x_coordinate(iteration, panel), y_coordinate(value))
-            for iteration, value in enumerate(median_history)
+            (x_coordinate(state, panel), y_coordinate(value))
+            for state, value in enumerate(median_history)
         ]
         parts.append(
             f'<polyline points="{polyline(median_points)}" stroke="{colors["median"]}" stroke-width="3"/>'
@@ -177,7 +173,7 @@ def chart_svg(
 
     parts.extend(
         (
-            f'<text x="{width / 2:.2f}" y="{height - 8}" text-anchor="middle" fill="{colors["text"]}" font-size="13">Accepted L-BFGS iteration</text>',
+            f'<text x="{width / 2:.2f}" y="{height - 8}" text-anchor="middle" fill="{colors["text"]}" font-size="13">Recorded optimizer state</text>',
             f'<text x="16" y="{top + plot_height / 2:.2f}" text-anchor="middle" transform="rotate(-90 16 {top + plot_height / 2:.2f})" fill="{colors["text"]}" font-size="13">Total loss · log scale</text>',
             "</g></svg>",
         )
@@ -188,8 +184,8 @@ def chart_svg(
 def main() -> None:
     args = parse_args()
     requested = args.history or [
-        ("Disk", "output/disk_robin_seed_scan_history.csv"),
-        ("Triple-peak", "output/triple_peak_robin_seed_scan_history.csv"),
+        ("Disk", "output/disk_seed_scan_history.csv"),
+        ("Triple-peak", "output/triple_peak_seed_scan_history.csv"),
     ]
     panels = [(label, read_histories(Path(path))) for label, path in requested]
     args.svg.parent.mkdir(parents=True, exist_ok=True)
