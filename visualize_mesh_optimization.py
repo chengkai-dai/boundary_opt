@@ -22,8 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--minimum-gap", type=float, default=0.03)
-    parser.add_argument("--target-arc-width", type=float, default=0.10)
-    parser.add_argument("--width-weight", type=float, default=0.10)
+    parser.add_argument("--target-arc-width", type=float)
+    parser.add_argument("--width-weight", type=float, default=0.0)
     parser.add_argument(
         "--screenshot",
         type=Path,

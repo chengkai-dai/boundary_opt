@@ -1,10 +1,11 @@
-"""Differentiable four-parameter boundary optimization on triangle meshes.
+"""Four-parameter harmonic boundary optimization on triangle meshes.
 
 The four design variables produce four ordered cyclic knots.  They define a
-C2 boundary profile with a zero plateau, a smooth rise, a one plateau, and a
-smooth fall.  The interior is the cotangent-harmonic extension of that fixed
-boundary data.  Gradients use one exact adjoint backsolve; no knitting code,
-autodiff framework, moving vertex set, or contour extraction is involved.
+P1-compatible boundary profile with a zero plateau, a linear rise, a one
+plateau, and a linear fall.  The interior is the cotangent-harmonic extension
+of that fixed boundary data.  Within each boundary-edge cell, gradients use
+one exact adjoint backsolve; no knitting code, autodiff framework, moving
+vertex set, or contour extraction is involved.
 """
 
 from __future__ import annotations
@@ -150,19 +151,10 @@ def boundary_arclength(vertices: FloatArray, loop: IntArray) -> FloatArray:
     return np.concatenate(([0.0], np.cumsum(lengths[:-1]))) / perimeter
 
 
-def _smoothstep5(values: FloatArray) -> FloatArray:
-    """Quintic smoothstep on [0, 1], with zero first/second endpoint slopes."""
-    return values**3 * (values * (values * 6.0 - 15.0) + 10.0)
-
-
-def _smoothstep5_derivative(values: FloatArray) -> FloatArray:
-    return 30.0 * values**2 * (values - 1.0) ** 2
-
-
 def cyclic_boundary_profile(
     positions: FloatArray, knots: FloatArray
 ) -> tuple[FloatArray, FloatArray]:
-    """Evaluate the cyclic 0/smooth-rise/1/smooth-fall profile and Jacobian.
+    """Evaluate the cyclic 0/linear-rise/1/linear-fall profile and Jacobian.
 
     ``knots`` are unwrapped and must satisfy ``k0 < k1 < k2 < k3 < k0 + 1``.
     The returned Jacobian has shape ``(len(positions), 4)``.
@@ -184,20 +176,18 @@ def cyclic_boundary_profile(
     rising = (local > first) & (local < second)
     rise_width = knots[2] - knots[1]
     z = (local[rising] - first) / rise_width
-    values[rising] = _smoothstep5(z)
-    slope = _smoothstep5_derivative(z) / rise_width
-    jacobian[rising, 1] = -slope * (1.0 - z)
-    jacobian[rising, 2] = -slope * z
+    values[rising] = z
+    jacobian[rising, 1] = -(1.0 - z) / rise_width
+    jacobian[rising, 2] = -z / rise_width
 
     values[(local >= second) & (local <= third)] = 1.0
 
     falling = local > third
     fall_width = knots[0] + 1.0 - knots[3]
     z = (local[falling] - third) / fall_width
-    values[falling] = 1.0 - _smoothstep5(z)
-    slope = _smoothstep5_derivative(z) / fall_width
-    jacobian[falling, 0] = slope * z
-    jacobian[falling, 3] = slope * (1.0 - z)
+    values[falling] = 1.0 - z
+    jacobian[falling, 0] = z / fall_width
+    jacobian[falling, 3] = (1.0 - z) / fall_width
     return values, jacobian
 
 

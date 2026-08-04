@@ -60,14 +60,21 @@ def chart_svg(
     all_values = [
         value for _, data in panels for history in data.values() for value in history
     ]
+    if not all_values or not all(math.isfinite(value) for value in all_values):
+        raise ValueError("loss histories must contain finite values")
+    positive_values = [value for value in all_values if value > 0.0]
+    display_floor = min(positive_values, default=1.0e-15) / 10.0
+    display_ceiling = max(max(all_values), display_floor * 10.0)
+    minimum_exponent = math.floor(math.log10(display_floor)) - 1
+    maximum_exponent = math.ceil(math.log10(display_ceiling)) + 1
     candidate_ticks = [
         value
-        for exponent in range(-12, 13)
+        for exponent in range(minimum_exponent, maximum_exponent + 1)
         for multiplier in (1, 3)
         if (value := multiplier * 10**exponent) > 0.0
     ]
-    lower = max(value for value in candidate_ticks if value <= min(all_values))
-    upper = min(value for value in candidate_ticks if value >= max(all_values))
+    lower = max(value for value in candidate_ticks if value <= display_floor)
+    upper = min(value for value in candidate_ticks if value >= display_ceiling)
     y_ticks = [value for value in candidate_ticks if lower <= value <= upper]
     x_ticks = list(range(0, maximum_iteration + 1, 10))
 
@@ -97,6 +104,7 @@ def chart_svg(
         )
 
     def y_coordinate(value: float) -> float:
+        value = max(value, display_floor)
         fraction = (math.log10(value) - math.log10(lower)) / (
             math.log10(upper) - math.log10(lower)
         )
@@ -156,7 +164,7 @@ def chart_svg(
         parts.extend(
             (
                 f'<text x="{x0:.2f}" y="22" fill="{colors["text"]}" font-size="15" font-weight="500">{escape(label)}</text>',
-                f'<text x="{x0 + panel_width - 4:.2f}" y="{y_coordinate(median_history[-1]) - 9:.2f}" text-anchor="end" fill="{colors["text"]}" font-size="12">median {median_history[-1]:.4f}</text>',
+                f'<text x="{x0 + panel_width - 4:.2f}" y="{y_coordinate(median_history[-1]) - 9:.2f}" text-anchor="end" fill="{colors["text"]}" font-size="12">median {max(median_history[-1], 0.0):.4f}</text>',
             )
         )
 
