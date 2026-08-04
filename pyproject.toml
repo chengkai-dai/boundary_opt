@@ -1,6 +1,6 @@
 [project]
 name = "clean-boundary-opt"
-version = "0.2.0"
+version = "0.3.0"
 description = "Differentiable four-endpoint harmonic boundary optimization on triangle meshes"
 requires-python = ">=3.11"
 dependencies = [

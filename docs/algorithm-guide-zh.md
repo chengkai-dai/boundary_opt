@@ -58,7 +58,7 @@ Disk 数据里有：
 - $B=209$ 个边界顶点；
 - $I=4108$ 个内部顶点。
 
-算法要求网格连通，并且只有一条流形边界环。它不是专门为圆盘写的；Disk、Plane、Peak、Triple Peak 只要满足这个拓扑条件，都走同一套算法。
+算法要求网格连通，并且只有一条流形边界环。它不是专门为圆盘写的；Disk、Plane、Peak、Triple Peak 只要满足这个**输入条件**，都走同一套代码。这里要提前区分：一条边界环不等于 topological disk，带 handle 的曲面也可能只有一条边界环。后文关于全局 harmonic conjugate 的解释会额外要求曲面可定向、单连通；当前求解器本身没有检查这些更强的拓扑条件。
 
 ### 2.2 标量场
 
@@ -750,6 +750,39 @@ L_{\mathrm{uniform}}
 \frac{\operatorname{Var}_w(q)}{\bar q^2}.
 $$
 
+这个逐面公式其实来自一个很干净的连续泛函。令 $A=|\mathcal M_h|=\sum_fA_f$，对任意**非恒定** P1 场 $u_h$，有
+
+$$
+\boxed{
+J_{\mathcal M_h}(u_h)
+=
+A\frac{\displaystyle\int_{\mathcal M_h}|\nabla u_h|^4\,dA}
+{\left(\displaystyle\int_{\mathcal M_h}|\nabla u_h|^2\,dA\right)^2}
+-1
+=L_{\mathrm{uniform}}.
+}
+$$
+
+为什么是精确等式？因为 P1 场的梯度在每个三角形内恒定，所以
+
+$$
+\int_{\mathcal M_h}|\nabla u_h|^p\,dA
+=\sum_fA_f|\nabla u_f|^p,
+\qquad p=2,4.
+$$
+
+这里没有使用数值 quadrature。Cauchy–Schwarz 不等式进一步给出
+
+$$
+J_{\mathcal M_h}(u_h)\ge0,
+\qquad
+J_{\mathcal M_h}(u_h)=0
+\iff
+|\nabla u_h|\text{ 几乎处处为同一非零常数}.
+$$
+
+这个结论应准确理解为“当前分片平坦网格和当前 P1 场上的精确代数恒等式”。它**不是** $u_h$ 向某个光滑连续解收敛的证明；由于泛函包含 $\int|\nabla u|^4$，真正的 mesh-refinement 理论需要 $W^{1,4}$ 层面的控制。第 11 节可选的 $L_{\mathrm{width}}$ 也不属于 $J$，启用它以后只有 uniformity 部分仍与上式相等。
+
 因此：
 
 - $L=0$：每个三角形的平方梯度都相同；
@@ -767,7 +800,7 @@ $$
 
 三者不能混为同一个数字。若某个三角形的梯度严格为零，局部 spacing 是无穷，<code>spacing_cv</code> 也报告为无穷，而不是掩盖它。
 
-### 8.1 如何把“从 0 到 1”完整写进算法？
+### 8.1 用目标弧均值固定 canonical 0–1 gauge
 
 先区分两个场：
 
@@ -783,6 +816,36 @@ $$
 \qquad
 \Delta=\mu_1-\mu_0.
 $$
+
+在精确算术下，这个 span 并不是符号未知的经验量。把常数测试函数代入离散 Robin 弱式，并使用 $S\mathbf1=0$，得到
+
+$$
+\boxed{
+\ell_0\mu_0=\ell_1(1-\mu_1).
+}
+$$
+
+它表示蓝弧高于目标 0 的总量，与红弧低于目标 1 的总量保持平衡。在下面的非别名条件下，还可以看出 $\Delta$ 严格为正。记
+
+$$
+A_R=S+\rho(Q_0+Q_1),
+\qquad
+r_c=Q_c\mathbf1,
+\qquad
+f_c=\frac{r_c}{\ell_c},
+$$
+
+则 $A_R$ 是 SPD。若两条弧的归一化离散载荷不同，即 $f_0\ne f_1$（当前非重叠正长度目标弧一般满足），就有
+
+$$
+\boxed{
+\Delta
+=\frac{\rho\ell_0\ell_1}{\ell_0+\ell_1}
+(f_1-f_0)^TA_R^{-1}(f_1-f_0)>0.
+}
+$$
+
+所以弱 Robin 极限下可能出现**很小但仍为正**的 span；明显的 $\Delta<0$ 不应当被解释成正常几何现象，而应优先检查退化网格、线性求解或实现。代码仍保留 small/negative-span guard，因为有限精度下不能把这个理论性质当成跳过数值检查的理由。
 
 然后固定 affine gauge：
 
@@ -824,9 +887,43 @@ $$
 \hat R_1=\sqrt{\frac{(\hat u_B-\mathbf1)^TQ_1(\hat u_B-\mathbf1)}{\ell_1}},
 $$
 
-分别通过 <code>raw_*_target_rms</code> 和 <code>canonical_*_target_rms</code> 报告。它们和 $\Delta$ 是质量诊断，不会默认以任意权重混入 uniformity loss。校准保证的是两条弧的**均值**为 0 和 1；$\hat u$ 仍可能轻微 overshoot，也不保证弧上每个点严格等于 target。
+分别通过 <code>raw_*_target_rms</code> 和 <code>canonical_*_target_rms</code> 报告。它们和 $\Delta$ 是质量诊断，不会默认以任意权重混入 uniformity loss。校准保证的是两条弧的**均值**为 0 和 1；$\hat u$ 仍可能轻微 overshoot，也不保证弧上每个点严格等于 target。因此本节说的是固定 0–1 gauge，不是把整条边界或整个场逐点夹到 $[0,1]$。
 
-### loss 对场的导数
+### 8.2 一个谨慎但有用的共形几何解释
+
+这一小节讨论的是算法背后的**连续二维曲面问题**。先把 $v$ 想成另一张等值线图：它的等值线与 $u$ 的等值线局部正交。在一块可定向、没有拓扑绕行的小邻域内，harmonic $u$ 有局部共轭函数 $v$，满足
+
+$$
+dv=*du.
+$$
+
+令 $F=(u,v)$，则
+
+$$
+F^*g_{\mathbb R^2}=|\nabla u|^2g_{\mathcal M},
+\qquad
+\operatorname{Jac}_{g}F=|\nabla u|^2.
+$$
+
+第一个等式说 $F$ 在局部保持角度；第二个等式说 $q=|\nabla u|^2$ 正是它的面积伸缩倍数。因此连续泛函也可以写成
+
+$$
+J(u)=
+\frac{\operatorname{Var}_{A}(\operatorname{Jac}_{g}F)}
+{\mathbb E_A[\operatorname{Jac}_{g}F]^2}.
+$$
+
+这给出了比“颜色变化均匀”更精确的几何解释：算法在低维 Robin 边界控制族中，让局部共形映射的**面积尺度**尽量均匀。若 $|\nabla u|$ 是非零常数，$F$ 才是常尺度的 local similarity。
+
+但这里有三条边界不能越过：
+
+1. 局部共轭总可以讨论；全局单值的 $v$ 还需要 $*du$ 没有周期。可定向的 topological disk 足够，而“只有一条边界环”不够。
+2. 若 $\nabla u=0$，$F$ 在该点退化，是 branched/critical point，不是有效坐标。小的积分 loss 也不能给出点态的最小梯度下界。
+3. 即使全局共轭存在，也没有自动得到 injectivity；当前算法没有证明等值线不分叉、映射不重叠或全局 bi-Lipschitz。
+
+所以最准确的定位是“共形面积 Jacobian 的均匀化”，而不是已经构造了一个全局无分支的共形参数化。对当前 P1 代码，这首先是连续结构解释；离散场是否收敛到这个连续对象仍需第 17.6 节所述实验。
+
+### 8.3 loss 对场的导数
 
 如果你只想使用算法，可以跳过这一小节。为了说明它真的可微，定义
 
@@ -1042,13 +1139,23 @@ SLSQP 每轮拿到：
 
 - SLSQP 能在常规条件下收敛到满足 KKT 条件的局部 stationary point；
 - 它不能保证找到 global minimum；
-- 最稳妥的做法是随机多个 seed，比较最终 loss，并检查 constraint violation、KKT residual 和几何结果；
+- 小 KKT residual 只是一阶必要条件，不能单独区分 local minimum、saddle 和 local maximum；
+- 最稳妥的做法是随机多个 seed，比较最终 loss，并检查 constraint violation、KKT residual、可行切空间二阶信息和几何结果；
 - 对只有四个可行自由度的问题，multistart 很便宜，也很自然。
 
 在 active constraint 上，普通梯度范数不必为零，因为约束反力会平衡梯度。因此代码不再把 <code>norm(result.jac)</code> 当作成功标准，而是报告：
 
 - <code>constraint_violation</code>：最终 gaps 对 simplex 的违反量；
 - <code>kkt_residual</code>：free gaps 的梯度是否相等、active gaps 的梯度符号是否正确，以及循环平移方向是否 stationary。
+- <code>minimum_projected_hessian_eigenvalue</code>：把数值 Hessian 投影到当前 active constraints 的可行切空间后，报告其最小特征值。
+
+第三个量提供的是二阶**数值证据**。实现会冻结正乘子的 strongly-active bounds，同时对 weakly-active bounds 使用一个保守的较大测试空间：明显为正时，在约束违反量与一阶 KKT residual 已经足够小、active-set 判断可靠的前提下，它支持严格局部极小；明显为负时表示当前二阶诊断不能认证 local minimum，只有对应方向也位于真正的 critical cone 时才能直接判定存在可行负曲率；接近 0 则表示平坦方向或数值上无法判定。
+
+还有一个很重要的光滑性限制：moving-arc pipeline 一般是 $C^1$ 而不是 $C^2$。若某个 knot 太靠近 boundary vertex，中心差分会混合顶点两侧的曲率，经典 Hessian 在该处也未必存在；代码此时直接报告 <code>nan</code>，表示二阶检查 inconclusive。只有所有差分样本留在同一组光滑 boundary-edge cells 内时，才解释该特征值。Plane 四角零-loss 解恰好位于顶点，所以它由 $J\ge0$ 直接证明为全局最优，不依赖 projected Hessian。
+
+即使值有限，它仍不是全局最优证明，也会受到有限差分步长、active-set 容差和浮点误差影响。最可靠的实践是把它与小尺度随机可行扰动测试一起看。
+
+这里最多有四个可行切向方向，所以中心差分现有解析梯度至多额外调用 8 次 PDE＋adjoint；结果中的 <code>evaluations</code> 仍只统计优化器本身的 objective evaluations，不把这项事后诊断混进去。
 
 当前代码用 seeds 0–15、每次最多 100 个 major iterations 得到：
 
@@ -1058,7 +1165,7 @@ SLSQP 每轮拿到：
 | Disk | 16/16 | 结果形成一簇 | $0.237119$ / $0.245503$ / $0.258962$ |
 | Triple Peak | 16/16 | 15/16 到约 $0.3505$ basin | $0.350497$ / $0.350633$ / $1.428840$ |
 
-Plane 与 Triple Peak 各有一个 run 停在明显更差、但仍满足 KKT 的 basin。这正好说明 <code>success=True</code> 表示“约束局部求解成功”，不表示“找到了全局最优”。
+Plane 与 Triple Peak 各有一个 run 停在明显更差、但仍满足一阶 KKT 的 basin。这正好说明 <code>success=True</code> 表示“约束求解达到一阶 stationary 条件”，不表示“找到了局部极小或全局最优”；local-minimum 判断还应结合上面的 projected Hessian。
 
 Adam 并不会自动把非凸问题变成全局优化，也不能原生处理这里的闭 simplex。当前问题没有 stochastic mini-batch，使用解析梯度的低维约束优化更直接。
 
@@ -1108,7 +1215,47 @@ $$
 
 - 初始场在右下角变化极快，等值线挤成一团；
 - 优化后等值线大体平行、间距更均匀；
-- Disk 的圆形边界法向不断变化，再加上 Robin/Neumann 的分段边界条件，所以最终 loss 通常不是 0。这里的原因是边界几何，不是表面曲率；当前 <code>disk.obj</code> 本身是平面网格。
+- Disk 的圆形边界法向不断变化，再加上 Robin/Neumann 的分段边界条件，所以实验中的最终 loss 没有达到 0。这里的原因是边界几何，不是表面曲率；当前 <code>disk.obj</code> 本身是平面网格。下面的连续定理解释这个现象，但不会把某次离散局部优化的数值自动认证为全局最优。
+
+### 13.1 连续圆盘为什么有严格正的最优值？
+
+先考虑理想的光滑平面圆盘，而不是某一张有限三角网格。固定有限 $0<\rho<\infty$，并把参数域写成
+
+$$
+\Theta_\varepsilon
+=S^1\times
+\left\{g\in\mathbb R^4:
+g_i\ge\varepsilon,
+\ \mathbf1^Tg=1
+\right\},
+\qquad 0<\varepsilon\le\frac14.
+$$
+
+$S^1$ 表示 origin 是循环变量；闭 simplex 和圆周都是 compact。正长度 target arcs 使 Robin 弱问题唯一可解。为了得到下面的统一正下界，还需要证明或明确假设：有限 Robin 下，移动端点得到的解关于参数在 $W^{1,4}$ 中连续；有了这一条件，$J(u_\theta)$ 才随参数 $\theta$ 连续。当前离散代码中的连续 endpoint mass 并不能自动替代这条连续 PDE 正则性论证。
+
+现在反设某个参数达到 $J=0$。连续平面域上的 harmonic 函数若有非零常梯度模，就必须是 affine：
+
+$$
+u(x)=a^Tx+b.
+$$
+
+而任意一段正长度的圆形 free arc 都要求
+
+$$
+\partial_\nu u=a\cdot n(s)=0.
+$$
+
+圆弧法向 $n(s)$ 会随 $s$ 转动，非零常向量 $a$ 不可能在整段圆弧上都与它垂直，因此只能 $a=0$。常数场又不能同时满足正长度 0-target 和 1-target Robin 条件，矛盾。所以参数域中没有 $J=0$ 的解。最后用 compactness 和连续性，才得到
+
+$$
+\boxed{
+\min_{\theta\in\Theta_\varepsilon}J(u_\theta)>0.
+}
+$$
+
+这里“每个参数都大于 0”和“存在统一的严格正下界”是两件事；后一步不能省掉 compactness 与连续性。$\varepsilon=0$、让 $\rho$ 同时趋于无穷，或允许端点退化，都不在这个命题里。
+
+还必须区分连续与离散：<code>disk.obj</code> 是 polygonal boundary 上的 P1 Galerkin 问题。离散 harmonic 只对有限测试空间成立，而“所有三角形的梯度模相同”本身不强迫 P1 场全局 affine。因此上面的定理提供连续几何解释，却不直接证明当前离散最小值严格为正，更不证明 seed 0 的 $0.252757$ 是全局最优；这两步需要离散结构证明或 mesh-refinement 证据。
 
 这也解释了为什么旧版本出现的 0.06、0.02 和当前 0.25 不能只看数字比较：如果边界离散方式、Robin/Dirichlet 模型、width prior 或 loss 定义不同，它们是在优化不同的目标。教程中的数字全部来自当前 Robin + exact arc mass + unregularized width + direct-simplex 实现。
 
@@ -1116,13 +1263,21 @@ $$
 
 ---
 
-## 14. Plane：为什么理论最优是四个角？
+## 14. Plane：为什么四个角能达到理论全局最优？
 
 对一个矩形平面，如果蓝弧和红弧分别覆盖一对相对的完整边，另外两条边自由，那么 latent Robin 解是一个仿射场，例如沿竖直方向
 
 $$
 u(x,y)=ay+b.
 $$
+
+这个结论背后有一个连续刚性事实。在连通平面域内，若 $u$ harmonic 且 $|\nabla u|$ 是常数，则
+
+$$
+\frac12\Delta|\nabla u|^2=|\operatorname{Hess}u|^2=0,
+$$
+
+所以 $\operatorname{Hess}u=0$，也就是 $u$ 必须 affine。矩形四角构型反过来确实构造出了这样的解。affine 函数又能被 P1 空间精确表示，当前 exact boundary integration 也精确，因此这个构型在连续问题和当前离散问题里都达到 $J=0$；由 $J\ge0$，它必然是全局最优构型之一。这里证明了“四角能达到全局最优”，没有额外证明所有可能的离散零-loss 构型都只有这一种。
 
 它满足：
 
@@ -1163,6 +1318,12 @@ $$
 5. 是否只跑了一个不好的初值或过早停止。
 
 Plane 是这套算法最重要的 sanity check：当前实现应能达到数值意义上的 0。
+
+### 14.1 曲面上的常梯度意味着什么？
+
+在二维 Riemannian 曲面上，非恒定 harmonic $u$ 若满足 $|\nabla u|=c>0$，则常模条件和 $\Delta u=0$ 一起推出 $\operatorname{Hess}u=0$。因此 $\nabla u$ 是非零平行向量场，所在区域的内蕴 Gaussian curvature 必须为 0；在局部平坦展开坐标中，$u$ 才可称为 affine，第 8.2 节的 $F=(u,v)$ 则是 local similarity。
+
+这里说的是**内蕴曲率**。圆柱在三维中看起来弯曲，但 Gaussian curvature 为 0，并不被这个结论排除。相反，只要区域中某处有非零 Gaussian curvature，连续的非恒定 harmonic 场就不可能处处保持同一个梯度模。这个连续结论同样不能未经收敛分析直接替代 P1 离散证明。
 
 ---
 
@@ -1314,7 +1475,7 @@ $$
 优化器返回 success 不等于几何结果一定合理。还应检查：
 
 - 多个 seed 的最终 loss 分布；
-- constraint violation 与 KKT residual；
+- constraint violation、KKT residual 与 projected Hessian 最小特征值；
 - raw span、两侧 target RMS、gradient CV 与 spacing CV；
 - 蓝、红、灰边界段是否与 knot 一致；
 - 等值线是否真的更均匀；
@@ -1385,6 +1546,39 @@ $$
 
 如果研究目标要求逐位重现旧路径，就必须冻结旧分块写法、NumPy/SciPy、BLAS、硬件和线程配置。当前项目更重视数学结构清楚，因此选择前向 $E$、反向 $E^T$ 的统一写法，并用多个随机初值评价性能。
 
+### 17.6 已有实验入口，以及仍需完成的几何与收敛验证
+
+当前脚本已经能对 mesh、Robin penalty、均匀细分层级和随机 seed 做笛卡尔积扫描。例如：
+
+~~~bash
+uv run python scan_mesh_seeds.py \
+  --mesh data/disk.obj \
+  --boundary-penalty 10 100 1000 \
+  --refinements 0 1 \
+  --seeds 4 \
+  --output output/disk_mesh_penalty_sweep.csv
+~~~
+
+每一级 <code>--refinements</code> 都把共享边中点只建立一次，并将每个三角形均匀分成四个；主 CSV 和 history CSV 都记录 mesh、$\rho$ 和 refinement level。这给出了可复现的嵌套离散回归入口。绘制统计曲线时应按同一个 mesh、$\rho$ 和 refinement level 分组，不能把整份 sweep 的不同配置混成一条 median。下面两组更完整的实验仍然很重要，但**不是当前版本已经完成的结论**。
+
+第一组是论文级 mesh resolution $\times\rho$ 的二维 sweep。脚本内均匀细分保持同一张分片平坦曲面，不能代替所有 remeshing 误差；因此仍应至少使用 3–4 个独立重网格分辨率和多档有限 Robin 强度，统一报告：
+
+- 优化后的 knots 与 gaps；
+- $J$、raw span、target RMS；
+- minimum gradient、gradient CV 与 spacing CV；
+- endpoint 附近的局部误差。
+
+这才能观察 P1 离散是否稳定趋向同一个连续边界布局，也能看清 $h\to0$ 与 $\rho\to\infty$ 是否可以交换。当前的嵌套细分入口可以发现明显的不稳定性，但还不能独自回答这个问题。
+
+第二组是显式几何有效性检查。应真正抽取多条 isolines，测量有限等值线之间的距离，并检测：
+
+- 离散 critical points 或近零梯度三角形；
+- isoline 的分叉、合并和闭环；
+- 局部 spacing surrogate 与实际有限间距的偏差；
+- 共轭映射可能的翻折、重叠或非单射。
+
+当前 <code>spacing_cv</code> 和 minimum gradient 是有用诊断，但它们还不是“无临界点、无分叉、全局有效参数化”的证明。
+
 ---
 
 ## 18. 当前算法的边界
@@ -1405,11 +1599,13 @@ $$
 - canonical $\hat u$ 只保证两条目标弧的均值为 0/1，允许弧内波动和轻微 overshoot；
 - raw span $\Delta$ 太小时 affine calibration 会病态并被拒绝；
 - uniformity loss 是局部 spacing 的稳定 surrogate，不是抽取有限等值线后的直接距离 loss；
+- loss 不排除孤立或小面积的 critical region，也不保证共轭映射 injective；
 - pipeline 通常是 $C^1$，不是 $C^\infty$；
-- 任意钝角网格上的 cotangent 离散不自动保证 discrete maximum principle；
+- discrete maximum principle 不能默认成立：钝角或非 Delaunay cotangent stiffness 会破坏 M-matrix 条件；即使 stiffness 本身合格，当前 exact consistent Robin mass $Q$ 的正非对角项也可能让组合矩阵失去 M-matrix 结构；
 - dense Schur 假设边界远小于整体；
 - 代数等价的浮点重排可能改变某个 seed 最终进入的 local basin；
 - 无边界网格、多个边界环或非流形边界会被拒绝；
+- 一条边界环不保证 topological disk；高 genus 或非定向情形没有全局 harmonic-conjugate 保证；
 - 当前只有两段目标弧；更多弧需要扩展参数化和右侧组装。
 
 ---
@@ -1425,7 +1621,7 @@ $$
 7. 计算每个三角形的 $|\nabla u|^2$，得到面积加权均匀性 loss。
 8. 解一次伴随方程，在四个端点处评价 $u$ 和 $p$。
 9. 得到四个 knot 梯度，再通过 normalization 与 cumulative-sum Jacobian 变成五坐标参数梯度。
-10. SLSQP 在 simplex 约束下更新五个存储坐标（四个可行自由度），直到 KKT 条件近似满足。
+10. SLSQP 在 simplex 约束下更新五个存储坐标（四个可行自由度），直到 KKT 条件近似满足；再用 projected Hessian 提供可行切空间上的二阶数值证据。
 11. 计算 $\mu_0,\mu_1,\Delta$ 和 boundary RMS，输出 $\hat u=(u-\mu_0)/\Delta$。
 12. 用多随机初值减少落入较差 local minimum 的风险。
 
@@ -1437,7 +1633,7 @@ $$
 
 > uniformity loss 负责场的相对 shape；目标弧均值校准负责明确的 0–1 gauge。
 
-> Plane 的四角解来自“仿射 harmonic field 具有常梯度”，而 Disk 的圆形边界几何与分段边界条件通常让最优 loss 保持非零。
+> Plane 四角构型精确产生零-loss affine 场；理想连续圆盘在正 free gaps、固定有限 Robin 和 compact 参数域下则有严格正的最优值。后者是连续结构定理，不替代当前 P1 离散问题的收敛与全局最优验证。
 
 ---
 

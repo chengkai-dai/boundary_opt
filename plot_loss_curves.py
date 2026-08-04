@@ -33,7 +33,8 @@ def read_histories(path: Path) -> dict[int, list[float]]:
             state = row.get("recorded_state", row.get("iteration"))
             if state is None:
                 raise ValueError(f"{path} has no recorded_state column")
-            histories[int(row["seed"])].append((int(state), float(row["loss"])))
+            run = row["run"] if "run" in row else row["seed"]
+            histories[int(run)].append((int(state), float(row["loss"])))
     return {
         seed: [value for _, value in sorted(points)]
         for seed, points in sorted(histories.items())

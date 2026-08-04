@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
         "--show", action="store_true", help="open the interactive viewer"
     )
     parser.add_argument(
+        "--final-only",
+        action="store_true",
+        help="show only the optimized result with standard Polyscope panels",
+    )
+    parser.add_argument(
         "--animate",
         action="store_true",
         help="loop over recorded optimizer states in the viewer",
@@ -263,6 +268,8 @@ def make_animation_callback(
 
 def main() -> None:
     args = parse_args()
+    if args.animate and args.final_only:
+        raise SystemExit("--animate and --final-only cannot be used together")
     if args.animate and (not np.isfinite(args.fps) or not 0.0 < args.fps <= 60.0):
         raise SystemExit("--fps must lie in (0, 60]")
     try:
@@ -307,7 +314,7 @@ def main() -> None:
     ps.set_up_dir("z_up")
     ps.set_view_projection_mode("orthographic")
     ps.set_SSAA_factor(2)
-    ps.set_build_default_gui_panels(False)
+    ps.set_build_default_gui_panels(args.final_only)
     ps.set_open_imgui_window_for_user_callback(False)
 
     import polyscope.imgui as psim
@@ -358,37 +365,48 @@ def main() -> None:
         optimizer.boundary_positions, result.knots
     )
     optimized_colors = boundary_edge_colors(optimized_zero, optimized_one)
-    register_state(
-        ps,
-        optimizer,
-        display_vertices,
-        f"before · seed {args.seed}",
-        initial_field,
-        initial_colors,
-        np.zeros(3),
-    )
-    register_state(
-        ps,
-        optimizer,
-        display_vertices,
-        "after",
-        result.field,
-        optimized_colors,
-        translation,
-    )
-    ps.look_at(target + np.asarray([0.0, 5.5 * extent, 2.0 * extent]), target)
-
-    ps.set_user_callback(
-        make_label_callback(
+    if args.final_only:
+        register_state(
             ps,
-            psim,
-            result.initial_loss,
-            result.final_loss,
+            optimizer,
+            display_vertices,
+            "optimized",
+            result.field,
+            optimized_colors,
+            np.zeros(3),
         )
-    )
+        ps.look_at(center + np.asarray([0.0, 5.5 * extent, 2.0 * extent]), center)
+    else:
+        register_state(
+            ps,
+            optimizer,
+            display_vertices,
+            f"before · seed {args.seed}",
+            initial_field,
+            initial_colors,
+            np.zeros(3),
+        )
+        register_state(
+            ps,
+            optimizer,
+            display_vertices,
+            "after",
+            result.field,
+            optimized_colors,
+            translation,
+        )
+        ps.look_at(target + np.asarray([0.0, 5.5 * extent, 2.0 * extent]), target)
+        ps.set_user_callback(
+            make_label_callback(
+                ps,
+                psim,
+                result.initial_loss,
+                result.final_loss,
+            )
+        )
 
     screenshot = args.screenshot or Path("output") / (
-        f"{args.mesh.stem}_before_after_polyscope.png"
+        f"{args.mesh.stem}_{'optimized' if args.final_only else 'before_after'}_polyscope.png"
     )
     screenshot.parent.mkdir(parents=True, exist_ok=True)
     ps.show(forFrames=5)

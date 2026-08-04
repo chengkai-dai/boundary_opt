@@ -9,6 +9,7 @@ from boundary_opt import (
     HarmonicBoundaryOptimizer,
     Mesh,
     _gap_kkt_residual,
+    _minimum_projected_hessian_eigenvalue,
     cotangent_stiffness,
     cyclic_arc_edge_weights,
     face_gradient_basis,
@@ -18,7 +19,7 @@ from boundary_opt import (
     random_knots,
 )
 from plot_loss_curves import chart_svg, read_histories
-from scan_mesh_seeds import relative_reduction
+from scan_mesh_seeds import relative_reduction, uniformly_refined
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -83,6 +84,23 @@ def test_robin_system_residual(optimizer: HarmonicBoundaryOptimizer) -> None:
         (zero_mass + one_mass) @ boundary_field - one_mass.sum(axis=1)
     )
     np.testing.assert_allclose(residual, 0.0, rtol=0.0, atol=2.0e-12)
+
+
+def test_robin_target_means_obey_conservation_and_have_positive_span(
+    optimizer: HarmonicBoundaryOptimizer,
+) -> None:
+    for seed in range(16):
+        knots = random_knots(seed, optimizer.minimum_gap)
+        field = optimizer.robin_field_from_knots(knots)
+        zero_mass = optimizer._arc_mass(knots[0], knots[1])
+        one_mass = optimizer._arc_mass(knots[2], knots[3])
+        zero_mean = _arc_mean(optimizer, field, knots[0], knots[1])
+        one_mean = _arc_mean(optimizer, field, knots[2], knots[3])
+
+        assert zero_mass.sum() * zero_mean == pytest.approx(
+            one_mass.sum() * (1.0 - one_mean), rel=2.0e-12, abs=2.0e-14
+        )
+        assert one_mean - zero_mean > 0.0
 
 
 def test_canonical_field_has_exact_target_arc_means_when_an_arc_wraps(
@@ -286,6 +304,13 @@ def test_loss_plot_reads_recorded_state_history(tmp_path: Path) -> None:
     history.write_text("seed,recorded_state,loss\n0,1,0.5\n0,0,1.0\n", encoding="utf-8")
     assert read_histories(history) == {0: [1.0, 0.5]}
 
+    sweep = tmp_path / "sweep.csv"
+    sweep.write_text(
+        "run,seed,recorded_state,loss\n0,0,0,1.0\n1,0,0,2.0\n",
+        encoding="utf-8",
+    )
+    assert read_histories(sweep) == {0: [1.0], 1: [2.0]}
+
 
 def test_zero_minimum_gap_is_rejected_consistently() -> None:
     with pytest.raises(ValueError, match="minimum_gap"):
@@ -363,6 +388,27 @@ def test_gap_kkt_residual_does_not_hide_near_bound_interior_gradients() -> None:
     assert residual == pytest.approx(1.5)
 
 
+def test_projected_hessian_freezes_only_strongly_active_bounds() -> None:
+    parameters = np.asarray([0.2, 0.1, 0.1, 0.3, 0.5])
+    gradient = np.asarray([0.0, 1.0, 0.0, 0.0, 0.0])
+
+    def minimum_eigenvalue(hessian: np.ndarray) -> float:
+        return _minimum_projected_hessian_eigenvalue(
+            lambda point: gradient + hessian @ (point - parameters),
+            parameters,
+            gradient,
+            minimum_gap=0.1,
+        )
+
+    strongly_active_negative = np.eye(5)
+    strongly_active_negative[1, 1] = -100.0
+    assert minimum_eigenvalue(strongly_active_negative) == pytest.approx(1.0)
+
+    weakly_active_negative = np.eye(5)
+    weakly_active_negative[2, 2] = -10.0
+    assert minimum_eigenvalue(weakly_active_negative) < -1.0
+
+
 def test_small_minimum_gap_keeps_slsqp_trial_fields_valid() -> None:
     optimizer = HarmonicBoundaryOptimizer(
         load_obj(ROOT / "data" / "disk.obj"), minimum_gap=1.0e-6
@@ -371,10 +417,24 @@ def test_small_minimum_gap_keeps_slsqp_trial_fields_valid() -> None:
         random_knots(0, minimum_gap=optimizer.minimum_gap), max_iterations=5
     )
     assert np.isfinite(result.field).all()
+    assert np.isfinite(result.minimum_projected_hessian_eigenvalue)
 
 
 def test_zero_initial_loss_has_finite_relative_reduction() -> None:
     assert relative_reduction(0.0, 0.0) == 0.0
+
+
+def test_uniform_refinement_shares_midpoints_and_preserves_area() -> None:
+    mesh = Mesh(
+        np.asarray(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]]
+        ),
+        np.asarray([[0, 1, 2], [0, 2, 3]]),
+    )
+    refined = uniformly_refined(mesh, 1)
+    assert len(refined.vertices) == 9
+    assert len(refined.faces) == 8
+    assert face_gradient_basis(refined)[0].sum() == pytest.approx(1.0)
 
 
 def test_cotangent_energy_matches_face_gradient_energy(
@@ -388,6 +448,25 @@ def test_cotangent_energy_matches_face_gradient_energy(
     stiffness_energy = float(field @ (stiffness @ field))
     gradient_energy = float(areas @ np.einsum("ij,ij->i", gradients, gradients))
     assert stiffness_energy == pytest.approx(gradient_energy, rel=2.0e-12)
+
+
+def test_uniformity_loss_equals_continuous_fourth_power_functional(
+    optimizer: HarmonicBoundaryOptimizer,
+) -> None:
+    field = np.random.default_rng(19).normal(size=len(optimizer.mesh.vertices))
+    loss, _ = optimizer._uniformity_loss_and_gradient(field)
+    gradients = optimizer._face_gradients(field)
+    squared_norms = np.einsum(
+        "ij,ij->i",
+        gradients,
+        gradients,
+    )
+    total_area = float(optimizer.face_areas.sum())
+    energy = float(optimizer.face_areas @ squared_norms)
+    functional = (
+        total_area * float(optimizer.face_areas @ squared_norms**2) / energy**2 - 1.0
+    )
+    assert loss == pytest.approx(functional, rel=2.0e-14, abs=2.0e-14)
 
 
 def test_full_five_coordinate_gradient(optimizer: HarmonicBoundaryOptimizer) -> None:
@@ -443,6 +522,7 @@ def test_plane_corner_arcs_produce_affine_field() -> None:
     assert result.final_loss < 1.0e-10
     assert result.success
     assert result.kkt_residual <= 1.0e-5
+    assert np.isnan(result.minimum_projected_hessian_eigenvalue)
     assert np.all(endpoint_distances.min(axis=1) < 1.0e-5)
 
 
@@ -467,6 +547,7 @@ def test_optimization_decreases_loss(optimizer: HarmonicBoundaryOptimizer) -> No
         assert optimizer.loss_and_gradient(parameters)[0] == pytest.approx(loss)
     assert np.all(result.gaps >= optimizer.minimum_gap - 1.0e-10)
     assert result.constraint_violation <= 1.0e-10
+    assert np.isfinite(result.minimum_projected_hessian_eigenvalue)
     assert result.statistics.gradient_cv > 0.0
     assert result.statistics.spacing_cv > 0.0
     np.testing.assert_allclose(

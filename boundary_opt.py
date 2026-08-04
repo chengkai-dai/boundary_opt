@@ -14,6 +14,7 @@ variables and a linear simplex constraint keep the four endpoints ordered.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -96,6 +97,7 @@ class OptimizationResult:
     evaluations: int
     constraint_violation: float
     kkt_residual: float
+    minimum_projected_hessian_eigenvalue: float
     success: bool
     message: str
 
@@ -302,6 +304,55 @@ def _gap_kkt_residual(
     residuals.extend(np.abs(gap_gradient[free] - multiplier))
     residuals.extend(np.maximum(multiplier - gap_gradient[active], 0.0))
     return float(max(residuals))
+
+
+def _minimum_projected_hessian_eigenvalue(
+    gradient_function: Callable[[FloatArray], FloatArray],
+    parameters: FloatArray,
+    gradient: FloatArray,
+    minimum_gap: float,
+) -> float:
+    """Estimate the least curvature on a conservative feasible tangent space."""
+    parameters = np.asarray(parameters, dtype=np.float64)
+    gradient = np.asarray(gradient, dtype=np.float64)
+    gaps = parameters[1:]
+    gap_gradient = gradient[1:]
+    scale = max(1.0, float(np.abs(gaps).max()))
+    active = gaps <= minimum_gap + 64.0 * np.finfo(np.float64).eps * scale
+    if np.all(active):
+        active = np.zeros_like(active)
+    multiplier = float(gap_gradient[~active].mean())
+    multiplier_tolerance = np.sqrt(np.finfo(np.float64).eps) * max(
+        1.0, float(np.abs(gap_gradient).max())
+    )
+    strongly_active = active & (gap_gradient - multiplier > multiplier_tolerance)
+
+    constraints = [np.asarray([0.0, 1.0, 1.0, 1.0, 1.0])]
+    for gap_index in np.flatnonzero(strongly_active):
+        constraint = np.zeros(5, dtype=np.float64)
+        constraint[gap_index + 1] = 1.0
+        constraints.append(constraint)
+    tangent = scipy.linalg.null_space(np.vstack(constraints))
+
+    hessian_times_tangent = []
+    base_step = np.cbrt(np.finfo(np.float64).eps)
+    for direction in tangent.T:
+        moving = np.abs(direction[1:]) > 0.0
+        step = base_step
+        if np.any(moving):
+            step = min(
+                step,
+                0.25
+                * float(
+                    np.min(gaps[moving] / np.abs(direction[1:][moving]))
+                ),
+            )
+        forward = gradient_function(parameters + step * direction)
+        backward = gradient_function(parameters - step * direction)
+        hessian_times_tangent.append((forward - backward) / (2.0 * step))
+    projected = tangent.T @ np.column_stack(hessian_times_tangent)
+    projected = 0.5 * (projected + projected.T)
+    return float(scipy.linalg.eigvalsh(projected, check_finite=False)[0])
 
 
 def random_knots(seed: int, minimum_gap: float = 0.03) -> FloatArray:
@@ -779,7 +830,7 @@ class HarmonicBoundaryOptimizer:
         )
 
         parameters = np.asarray(result.x, dtype=np.float64)
-        knots, _, gaps = knots_from_parameters(parameters)
+        knots, knot_jacobian, gaps = knots_from_parameters(parameters)
         robin_field = self.robin_field_from_knots(knots)
         field, boundary_statistics = self._canonicalize_field(robin_field, knots)
         uniformity_loss, _ = self._uniformity_loss_and_gradient(robin_field)
@@ -799,6 +850,27 @@ class HarmonicBoundaryOptimizer:
             )
         )
         kkt_residual = _gap_kkt_residual(final_gradient, raw_gaps, self.minimum_gap)
+        vertex_distances = np.min(
+            np.abs(
+                (knots[:, None] - self.boundary_positions[None, :] + 0.5) % 1.0
+                - 0.5
+            ),
+            axis=1,
+        )
+        finite_difference_motion = np.cbrt(np.finfo(np.float64).eps) * np.linalg.norm(
+            knot_jacobian, axis=1
+        )
+        if np.any(vertex_distances <= finite_difference_motion):
+            minimum_projected_hessian_eigenvalue = np.nan
+        else:
+            minimum_projected_hessian_eigenvalue = (
+                _minimum_projected_hessian_eigenvalue(
+                    lambda point: self.loss_and_gradient(point)[1],
+                    parameters,
+                    final_gradient,
+                    self.minimum_gap,
+                )
+            )
         success = bool(
             result.success and constraint_violation <= 1.0e-8 and kkt_residual <= 1.0e-5
         )
@@ -824,6 +896,9 @@ class HarmonicBoundaryOptimizer:
             evaluations=evaluation_count,
             constraint_violation=constraint_violation,
             kkt_residual=kkt_residual,
+            minimum_projected_hessian_eigenvalue=(
+                minimum_projected_hessian_eigenvalue
+            ),
             success=success,
             message=message,
         )
