@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
+from .defaults import DEFAULT_MINIMUM_GAP
 from .simplex import (
     FEASIBILITY_TOLERANCE,
     parameters_are_feasible,
@@ -19,14 +20,6 @@ _CENTER_GAP_TO_KNOTS = np.asarray(
         [1.0, 0.25, -0.50, -0.25, 0.0],
         [1.0, 0.25, 0.50, -0.25, 0.0],
         [1.0, 0.25, 0.50, 0.75, 0.0],
-    ]
-)
-_KNOT_TO_GAPS = np.asarray(
-    [
-        [-1.0, 1.0, 0.0, 0.0],
-        [0.0, -1.0, 1.0, 0.0],
-        [0.0, 0.0, -1.0, 1.0],
-        [1.0, 0.0, 0.0, -1.0],
     ]
 )
 
@@ -131,14 +124,9 @@ def canonical_knots(knots: FloatArray) -> FloatArray:
     return knots + (knots[0] % 1.0 - knots[0])
 
 
-def random_knots(seed: int, minimum_gap: float = 0.03) -> FloatArray:
+def random_knots(seed: int, minimum_gap: float = DEFAULT_MINIMUM_GAP) -> FloatArray:
     """Draw an ordered cyclic four-knot initialization for one seed."""
     minimum_gap = validate_minimum_gap(minimum_gap)
     rng = np.random.default_rng(seed)
     gaps = minimum_gap + (1.0 - 4.0 * minimum_gap) * rng.dirichlet(np.ones(4))
     return float(rng.uniform()) + np.concatenate(([0.0], np.cumsum(gaps[:3])))
-
-
-def knot_gap_jacobian() -> FloatArray:
-    """Return d(g0,g1,g2,g3)/d(theta0,...,theta3)."""
-    return _KNOT_TO_GAPS

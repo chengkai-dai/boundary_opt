@@ -55,7 +55,15 @@ flowchart LR
     K --> Z["完整边界 trace z"]
     Z --> U["harmonic solve: u = Ez"]
     U --> G["每个三角形的 ∇u"]
-    G --> L["uniformity loss L"]
+    U --> A["area CDF Fσ(t)"]
+    U --> I["soft isoline lengths"]
+    G --> LG["gradient uniformity"]
+    G --> I
+    A --> LA["area balance"]
+    I --> LI["isoline-length differences"]
+    LG --> L["weighted total loss"]
+    LA --> L
+    LI --> L
     L -. "field sensitivity" .-> U
     U -. "adjoint Eᵀ" .-> Z
     Z -. "profile Jacobian" .-> K
@@ -267,7 +275,7 @@ I_B
 \boldsymbol u=E\boldsymbol z.
 \]
 
-显式形成 \(E\) 通常会得到一个大而稠密的矩阵，所以代码不保存它。`extend` 通过稀疏
+显式形成 \(E\) 通常会得到一个大而稠密的矩阵，所以代码不保存它。`solve` 通过稀疏
 回代隐式完成同一个线性映射，数值模型没有任何差别。
 
 如果只关心边界能量，还可以写出 Schur complement
@@ -283,7 +291,7 @@ S=K_{BB}-K_{BI}K_{II}^{-1}K_{IB},
 
 ---
 
-## 7. Loss 究竟测量什么？
+## 7. 三个 loss 究竟测量什么？
 
 P1 field 在每个三角形 \(f\) 内有常梯度。记
 
@@ -339,7 +347,89 @@ du\approx\lVert\nabla u\rVert\,d\ell.
 因此梯度模长越均匀，固定 value increment 的局部 isoline spacing 越均匀。但这仍是
 proxy：它不直接测整条等值线之间的 geodesic distance，也不评价等值线形状和拓扑。
 
-### 7.2 Loss 自身不保证“从 0 到 1”
+### 7.2 Area balance：控制场值的面积分布
+
+令
+
+\[
+A(t)=\operatorname{Area}\{x\in M:u(x)\le t\}.
+\]
+
+阈值从 \(t\) 增加到 \(t+dt\) 时，isoline 上长度为 \(ds\) 的小段沿法向移动
+\(dt/|\nabla u|\)，因此 coarea formula 给出
+
+\[
+\frac{dA}{dt}
+=\int_{\Gamma_t}\frac{1}{|\nabla u|}\,ds,
+\qquad \Gamma_t=\{x:u(x)=t\}.
+\]
+
+已有的 uniformity loss 使 \(|\nabla u|\) 接近常数，所以等值区间覆盖相同面积时，相邻
+isoline 的长度也接近相同。代码使用归一化面积 CDF
+
+\[
+F_\sigma(t_j)
+=\sum_f w_f\,
+S\!\left(\frac{t_j-\bar u_f}{\sigma}\right),
+\]
+
+其中 \(S\) 是 sigmoid，\(\bar u_f\) 是 face 三个顶点值的平均。目标是平滑后的 uniform
+distribution CDF：
+
+\[
+F_\sigma^{\mathrm{uniform}}(t)
+=\sigma\left[
+\operatorname{softplus}\!\left(\frac{t}{\sigma}\right)
+-\operatorname{softplus}\!\left(\frac{t-1}{\sigma}\right)
+\right].
+\]
+
+最终定义
+
+\[
+L_{\mathrm{area}}
+=\frac1m\sum_{j=1}^m
+\left(F_\sigma(t_j)-F_\sigma^{\mathrm{uniform}}(t_j)\right)^2.
+\]
+
+当前使用 \(t_j=0.05,0.10,\ldots,0.95\) 和 \(\sigma=0.01\)。它不提取 contour，处处可微，
+解析 field gradient 位于
+[`area_balance_loss_and_gradient`](boundary_opt/loss.py)。
+
+### 7.3 Soft isoline-length：直接比较等值线长度
+
+真实等值线长度可以用 coarea identity 写成
+
+\[
+\ell(t)=\int_{\Gamma_t}ds
+=\int_M\delta(u(x)-t)|\nabla u(x)|\,dA.
+\]
+
+实现中用宽度 \(\sigma=0.03\) 的 Gaussian 代替 Dirac delta，并在每个三角形内使用三个
+barycentric quadrature points：
+
+\[
+\hat\ell(t_j)
+=\frac{1}{c_j}\sum_f w_f|\nabla u_f|
+\frac13\sum_{q=1}^3
+\delta_\sigma(u_{fq}-t_j).
+\]
+
+其中 \(c_j\) 修正靠近 0 和 1 时 Gaussian 被值域截断的质量。相邻长度差 loss 为
+
+\[
+L_{\mathrm{isoline}}
+=\frac{
+\frac1{m-1}\sum_{j=1}^{m-1}
+[\hat\ell(t_{j+1})-\hat\ell(t_j)]^2
+}{\bar\ell^2+\varepsilon}.
+\]
+
+这仍不需要显式提取 contour，但与 area CDF 不同，它通过 \(|\nabla u|\) 消掉了 coarea
+公式里的 reciprocal-gradient 因子，因此直接估计长度。实现位于
+[`isoline_length_loss_and_gradient`](boundary_opt/loss.py)。
+
+### 7.4 Loss 自身不保证“从 0 到 1”
 
 由于 scale invariance，几乎常值但相对均匀的场也可能得到很低的 CV loss。当前模型的
 0 与 1 来自完整边界 profile，而不是 uniformity loss。
@@ -357,29 +447,20 @@ proxy：它不直接测整条等值线之间的 geodesic distance，也不评价
 
 ---
 
-## 8. 可选的 plateau-width prior
+## 8. 总目标
 
-默认目标只有 uniformity loss。若希望两个 plateau 接近指定归一化宽度 \(a\)，可以加入
-
-\[
-L_{\mathrm{width}}
-=\omega\left[
-\left(\frac{g_0-a}{a}\right)^2
-+\left(\frac{g_2-a}{a}\right)^2
-\right].
-\]
-
-总目标为
+完整目标为：
 
 \[
-L=L_{\mathrm{uniform}}+L_{\mathrm{width}}.
+L=\lambda_{\mathrm{uniform}}L_{\mathrm{uniform}}
++\lambda_{\mathrm{area}}L_{\mathrm{area}}
++\lambda_{\mathrm{isoline}}L_{\mathrm{isoline}}.
 \]
 
-构造函数参数是 `target_arc_width=a` 和 `width_weight=omega`。默认
-`width_weight=0`，即不使用 prior。开启它会改变数学问题，所以带 prior 和不带 prior
-的结果不能当成同一个 benchmark 比较。
-
-实现是 [`width_loss_and_gradient`](boundary_opt/loss.py)。
+默认值统一位于 `defaults.py`。Area loss 保留，但默认权重为零。三个权重只有相对比例
+影响优化路径：把它们同时乘以任意正数，只会等比例缩放公开报告的 total loss 与 history，
+不会改变 knots。实现中先除以最大权重，再组装 adjoint sensitivity，避免整体数值尺度泄漏
+进 backend。
 
 ---
 
@@ -430,6 +511,31 @@ L=\frac{m_2}{\mu^2}-1
 \end{bmatrix}.
 \]
 
+Area loss 的导数同样直接。若
+
+\[
+S_{fj}=S\!\left(\frac{t_j-\bar u_f}{\sigma}\right),
+\]
+
+则
+
+\[
+\frac{\partial F_\sigma(t_j)}{\partial \bar u_f}
+=-\frac{w_f}{\sigma}S_{fj}(1-S_{fj}).
+\]
+
+再把每个 face-center sensitivity 均分到三个顶点。总 field sensitivity 是
+
+\[
+\boldsymbol s
+=\lambda_{\mathrm{uniform}}
+\frac{\partial L_{\mathrm{uniform}}}{\partial\boldsymbol u}
++\lambda_{\mathrm{area}}
+\frac{\partial L_{\mathrm{area}}}{\partial\boldsymbol u}
++\lambda_{\mathrm{isoline}}
+\frac{\partial L_{\mathrm{isoline}}}{\partial\boldsymbol u}.
+\]
+
 ### 9.2 用一次 transpose solve 传回边界
 
 边界扰动 \(d\boldsymbol z\) 引起
@@ -467,8 +573,7 @@ K_{II}^T\boldsymbol\lambda=\boldsymbol s_I,
 =
 \left(\frac{\partial\boldsymbol\theta}{\partial\boldsymbol p}\right)^T
 \left(\frac{\partial\boldsymbol z}{\partial\boldsymbol\theta}\right)^T
-\frac{\partial L}{\partial\boldsymbol z}
-+\nabla_{\boldsymbol p}L_{\mathrm{width}}.
+\frac{\partial L}{\partial\boldsymbol z}.
 \]
 
 每次 objective + gradient 的主要成本是一遍 forward backsolve 和一遍 transpose
@@ -595,13 +700,13 @@ a_i=\widetilde g_i-\delta,
 from boundary_opt import BoundaryOptimizer, load_obj, random_knots
 
 mesh = load_obj("data/disk.obj")
-optimizer = BoundaryOptimizer(mesh, minimum_gap=0.03)
-initial_knots = random_knots(seed=0, minimum_gap=0.03)
+optimizer = BoundaryOptimizer(mesh)
+initial_knots = random_knots(seed=0)
 
 result = optimizer.optimize(
     initial_knots,
     backend="slsqp",
-    max_iterations=100,
+    max_iterations=240,
     seed=0,
 )
 ```
@@ -609,7 +714,7 @@ result = optimizer.optimize(
 将 `backend` 改为 `"spg"` 即可在完全相同的物理初值上切换算法。也可以一次运行两个：
 
 ```python
-results = optimizer.optimize_backends(initial_knots, max_iterations=100, seed=0)
+results = optimizer.optimize_backends(initial_knots, max_iterations=240, seed=0)
 ```
 
 每次 loss evaluation 的物理部分完全相同：
@@ -654,6 +759,7 @@ g_i\ge\delta,
 - 四个 gaps 各有 lower bound \(\delta\)；
 - 一个 `LinearConstraint` 精确表达 \(\sum_i g_i=1\)；
 - objective 同时返回 loss 和 exact gradient；
+- 传给 SciPy 的 loss 和 gradient 同除以初始 loss，使初始数值目标为 1；
 - callback 只记录可行的 iterates。
 
 SLSQP 每一步建立局部 quadratic subproblem，并用 merit-function line search 协调目标与
@@ -785,6 +891,7 @@ Disk 的边界接近旋转对称。若离散网格也足够均匀，一个自然
 - 上升段与下降段宽度接近；
 - 两组弧大致相隔半圈；
 - 内部 isolines 近似平行、间距比较均匀。
+- 相邻 value bands 的面积更均匀，抑制 isoline 长度忽长忽短。
 
 这些只是几何对称性对最优解的提示，不是代码写入的 symmetry constraint。三角剖分、边界
 采样、初值和局部 basin 都可能造成轻微不对称。
@@ -801,11 +908,10 @@ Disk 的边界接近旋转对称。若离散网格也足够均匀，一个自然
 
 ---
 
-## 16. 为什么 Plane 四角是可证明的全局最优？
+## 16. 为什么 Plane 四角是连续模型的全局最优？
 
 下面的证明要求：
 
-- `width_weight=0`；
 - mesh 的外边界是矩形，四个角是边界顶点；
 - 每条边的归一化长度都不小于 `minimum_gap`。
 
@@ -842,7 +948,22 @@ face 的梯度完全相同，于是
 L_{\mathrm{uniform}}=0.
 \]
 
-由于 \(L_{\mathrm{uniform}}\ge0\)，这不仅是局部最优，而是 global optimum。
+同时 \(u\) 在矩形面积上的分布严格 uniform，所以连续模型中
+
+\[
+F(t)=t,
+\qquad
+L_{\mathrm{area}}=0.
+\]
+
+每条内部等值线都是等长直线，所以
+
+\[
+L_{\mathrm{isoline}}=0.
+\]
+
+三个 loss 都非负，因此四角解是连续模型的 global optimum。离散 soft isoline loss 使用
+三点 triangle quadrature；当前 Plane 四角场上的 raw loss 约为 \(1.1\times10^{-11}\)。
 
 ![Plane 四角对应的 affine 零-loss 场](docs/figures/linear-plane-four-corners-polyscope.png)
 
@@ -850,7 +971,8 @@ L_{\mathrm{uniform}}=0.
 和 SPG 仍可能停在其他 stationary point 或 minimum-gap active face。判断实现是否健康时，
 应至少做三类检查：
 
-1. 直接把理论四角 knots 输入 `loss_and_knot_gradient`，验证 loss 接近离散精度极限；
+1. 直接把理论四角 knots 输入 `loss_and_knot_gradient`，验证 uniformity loss 接近零、
+   area loss 接近 quadrature 精度；
 2. 从四角附近扰动初值，验证两个 backend 能回到该 basin；
 3. 扫描随机 seeds，区分“理论解不存在”“离散实现错误”和“局部优化没有进入正确 basin”。
 
@@ -881,11 +1003,12 @@ simplex projection 在 active set 改变时也不是处处光滑；SPG 只需要
 
 1. **完整 profile 被规定**：四个 endpoints 决定包括两段斜坡在内的整圈 trace。
 2. **没有 edge 内精确 breakpoint**：连续 knot 只通过原 boundary-vertex samples 影响场。
-3. **Loss 是 spacing proxy**：不直接测真实 isoline distance、形状或拓扑。
+3. **Loss 仍是 proxy**：soft isoline loss 估计长度，但不显式提取 contour 的形状或拓扑。
 4. **Scale invariance**：0 到 1 由 boundary data 保证，不由 CV loss 推出。
 5. **局部优化**：SLSQP 与 SPG 都可能收敛到非全局 basin。
 6. **Active constraints**：达到 \(g_i=\delta\) 可以是合法 KKT 点，也可能是不理想的局部点。
-7. **Width prior 改变问题**：只能与相同 prior 设置的结果比较。
+7. **Loss 权重改变问题**：整体缩放不改变解，但改变权重比例就是不同的数学目标，不能把
+   两者的 total loss 直接比较。
 8. **Maximum principle 的离散条件**：一般非 Delaunay cotangent mesh 可能轻微 overshoot，
    应实际报告 field range。
 9. **拓扑限制**：当前只接受一个 manifold boundary loop，且必须存在 interior vertices。
@@ -899,11 +1022,12 @@ simplex projection 在 active set 改变时也不是处处光滑；SPG 只需要
 
 | 文件 | 职责 |
 |---|---|
+| [`boundary_opt/defaults.py`](boundary_opt/defaults.py) | 所有 public 默认参数的唯一来源 |
 | [`boundary_opt/mesh.py`](boundary_opt/mesh.py) | OBJ、边界拓扑、弧长、cotangent FEM 几何 |
 | [`boundary_opt/harmonic.py`](boundary_opt/harmonic.py) | harmonic 预分解、正向求解与 adjoint |
 | [`boundary_opt/boundary.py`](boundary_opt/boundary.py) | knots、gaps、profile 与 center/full-gap 转换 |
 | [`boundary_opt/simplex.py`](boundary_opt/simplex.py) | closed simplex、projection 与 KKT residual |
-| [`boundary_opt/loss.py`](boundary_opt/loss.py) | uniformity loss、width prior 与场统计 |
+| [`boundary_opt/loss.py`](boundary_opt/loss.py) | gradient、area、soft isoline-length 与场统计 |
 | [`boundary_opt/optimizer.py`](boundary_opt/optimizer.py) | objective、evaluation cache、结果与 backend dispatch |
 | [`boundary_opt/slsqp_backend.py`](boundary_opt/slsqp_backend.py) | exact-gradient constrained SLSQP |
 | [`boundary_opt/spg_backend.py`](boundary_opt/spg_backend.py) | BB1 SPG 与 nonmonotone Armijo |
@@ -924,17 +1048,17 @@ identity、完整参数 gradient、simplex projection、两个 backend 和 Plane
 ### 18.3 在 Disk 上分别扫描两个 backend
 
 ```bash
-uv run python scan_mesh_seeds.py \
-  --mesh data/disk.obj \
+uv run scan_mesh_seeds.py \
+  --mesh disk \
   --backend slsqp \
   --seeds 16 \
-  --iterations 100
+  --iterations 240
 
-uv run python scan_mesh_seeds.py \
-  --mesh data/disk.obj \
+uv run scan_mesh_seeds.py \
+  --mesh disk \
   --backend spg \
   --seeds 16 \
-  --iterations 100
+  --iterations 240
 ```
 
 默认输出分别写到 backend-specific CSV，避免互相覆盖。
@@ -942,23 +1066,23 @@ uv run python scan_mesh_seeds.py \
 ### 18.4 扫描 Plane 与 Triple Peak
 
 ```bash
-uv run python scan_mesh_seeds.py \
-  --mesh data/plane.obj \
+uv run scan_mesh_seeds.py \
+  --mesh plane \
   --backend slsqp \
   --seeds 16 \
-  --iterations 100
+  --iterations 240
 
-uv run python scan_mesh_seeds.py \
-  --mesh data/triple_peak.obj \
+uv run scan_mesh_seeds.py \
+  --mesh triple_peak \
   --backend spg \
   --seeds 16 \
-  --iterations 100
+  --iterations 240
 ```
 
 ### 18.5 画两个 backend 的 Disk loss curves
 
 ```bash
-uv run python plot_loss_curves.py \
+uv run plot_loss_curves.py \
   --history "Disk · SLSQP" output/disk_slsqp_seed_scan_history.csv \
   --history "Disk · SPG" output/disk_spg_seed_scan_history.csv \
   --title "Disk · centered full-gap backends" \
@@ -971,25 +1095,19 @@ history 是 accepted feasible iterates，不是每一次内部 objective evaluat
 ### 18.6 打开标准 Polyscope panel，只看最终 Disk
 
 ```bash
-uv run --extra visualization python visualize_mesh_optimization.py \
-  --mesh data/disk.obj \
-  --backend slsqp \
-  --seed 0 \
-  --iterations 100 \
-  --final-only \
-  --show
+uv run visualize_mesh_optimization.py
 ```
 
-换成 `--backend spg` 即可查看另一后端。去掉 `--show` 时会保存截图后退出。
+加上 `--backend spg` 即可查看另一后端；加上 `--screenshot-only` 会保存截图后退出。
 
 ### 18.7 播放优化动画
 
 ```bash
-uv run --extra visualization python visualize_mesh_optimization.py \
-  --mesh data/disk.obj \
+uv run visualize_mesh_optimization.py \
+  --mesh disk \
   --backend spg \
   --seed 0 \
-  --iterations 100 \
+  --iterations 240 \
   --animate \
   --fps 8
 ```
@@ -999,13 +1117,7 @@ uv run --extra visualization python visualize_mesh_optimization.py \
 ### 18.8 查看 Plane 最终结果
 
 ```bash
-uv run --extra visualization python visualize_mesh_optimization.py \
-  --mesh data/plane.obj \
-  --backend slsqp \
-  --seed 0 \
-  --iterations 100 \
-  --final-only \
-  --show
+uv run visualize_mesh_optimization.py --mesh plane
 ```
 
 ---
@@ -1034,8 +1146,10 @@ g_i\ge\delta,
 \qquad
 \boldsymbol u=E\boldsymbol z,
 \qquad
-L=\operatorname{CV}_{A}^{2}(\lVert\nabla u\rVert^2)
-+L_{\mathrm{width}}
+L=\lambda_{\mathrm{uniform}}
+\operatorname{CV}_{A}^{2}(\lVert\nabla u\rVert^2)
++\lambda_{\mathrm{area}}L_{\mathrm{area}}
++\lambda_{\mathrm{isoline}}L_{\mathrm{isoline}}
 }
 \]
 
@@ -1059,7 +1173,6 @@ E^T\boldsymbol s
 \left(\frac{\partial\boldsymbol\theta}{\partial\boldsymbol p}\right)^T
 \left(\frac{\partial\boldsymbol z}{\partial\boldsymbol\theta}\right)^T
 E^T\nabla_{\boldsymbol u}L
-+\nabla_{\boldsymbol p}L_{\mathrm{width}}
 }
 \]
 

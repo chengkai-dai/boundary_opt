@@ -7,7 +7,16 @@ from pathlib import Path
 
 import numpy as np
 
-from boundary_opt import BoundaryOptimizer, load_obj, random_knots
+from boundary_opt import (
+    DEFAULT_AREA_WEIGHT,
+    DEFAULT_ISOLINE_WEIGHT,
+    DEFAULT_MAX_ITERATIONS,
+    DEFAULT_MINIMUM_GAP,
+    DEFAULT_UNIFORMITY_WEIGHT,
+    BoundaryOptimizer,
+    load_obj,
+    random_knots,
+)
 from boundary_opt.boundary import (
     cyclic_boundary_profile,
     knots_from_parameters,
@@ -16,20 +25,28 @@ from boundary_opt.boundary import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mesh", type=Path, default=Path("data/disk.obj"))
+    parser.add_argument(
+        "--mesh", choices=("disk", "plane", "triple_peak"), default="disk"
+    )
     parser.add_argument("--backend", choices=("slsqp", "spg"), default="slsqp")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--iterations", type=int, default=100)
-    parser.add_argument("--minimum-gap", type=float, default=0.03)
-    parser.add_argument("--target-arc-width", type=float)
-    parser.add_argument("--width-weight", type=float, default=0.0)
+    parser.add_argument("--iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
+    parser.add_argument("--minimum-gap", type=float, default=DEFAULT_MINIMUM_GAP)
+    parser.add_argument(
+        "--uniformity-weight", type=float, default=DEFAULT_UNIFORMITY_WEIGHT
+    )
+    parser.add_argument("--area-weight", type=float, default=DEFAULT_AREA_WEIGHT)
+    parser.add_argument("--isoline-weight", type=float, default=DEFAULT_ISOLINE_WEIGHT)
     parser.add_argument(
         "--screenshot",
         type=Path,
         default=None,
     )
     parser.add_argument(
-        "--show", action="store_true", help="open the interactive viewer"
+        "--screenshot-only",
+        action="store_false",
+        dest="show",
+        help="save the image without opening the interactive viewer",
     )
     parser.add_argument(
         "--animate",
@@ -37,9 +54,10 @@ def parse_args() -> argparse.Namespace:
         help="loop over the feasible optimization record in the viewer",
     )
     parser.add_argument(
-        "--final-only",
-        action="store_true",
-        help="show only the optimized field with the standard Polyscope panels",
+        "--compare",
+        action="store_false",
+        dest="final_only",
+        help="show the initial and optimized fields side by side",
     )
     parser.add_argument("--fps", type=float, default=8.0)
     return parser.parse_args()
@@ -311,24 +329,22 @@ def make_animation_callback(
 
 def main() -> None:
     args = parse_args()
-    if args.animate and args.final_only:
-        raise SystemExit("--animate and --final-only are mutually exclusive")
     if args.animate and (not np.isfinite(args.fps) or not 0.0 < args.fps <= 60.0):
         raise SystemExit("--fps must lie in (0, 60]")
     try:
         import polyscope as ps
     except ModuleNotFoundError as exc:
         raise SystemExit(
-            "Polyscope is optional; run with `uv run --extra visualization python "
-            "visualize_mesh_optimization.py`."
+            "Polyscope is missing; run `uv sync` before starting the viewer."
         ) from exc
 
-    mesh = load_obj(args.mesh)
+    mesh = load_obj(Path("data") / f"{args.mesh}.obj")
     optimizer = BoundaryOptimizer(
         mesh,
         minimum_gap=args.minimum_gap,
-        target_arc_width=args.target_arc_width,
-        width_weight=args.width_weight,
+        uniformity_weight=args.uniformity_weight,
+        area_weight=args.area_weight,
+        isoline_weight=args.isoline_weight,
     )
     initial_knots = random_knots(args.seed, args.minimum_gap)
     initial_boundary, _ = cyclic_boundary_profile(
@@ -421,7 +437,7 @@ def main() -> None:
         )
         ps.look_at(center + np.asarray([0.0, 5.5 * extent, 2.0 * extent]), center)
         screenshot = args.screenshot or Path("output") / (
-            f"{args.mesh.stem}_{args.backend}_optimized_polyscope.png"
+            f"{args.mesh}_{args.backend}_optimized_polyscope.png"
         )
         screenshot.parent.mkdir(parents=True, exist_ok=True)
         ps.show(forFrames=5)
@@ -465,7 +481,7 @@ def main() -> None:
     )
 
     screenshot = args.screenshot or Path("output") / (
-        f"{args.mesh.stem}_{args.backend}_before_after_polyscope.png"
+        f"{args.mesh}_{args.backend}_before_after_polyscope.png"
     )
     screenshot.parent.mkdir(parents=True, exist_ok=True)
     ps.show(forFrames=5)

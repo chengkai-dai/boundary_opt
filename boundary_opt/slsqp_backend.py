@@ -8,7 +8,7 @@ import numpy as np
 import scipy.optimize
 from numpy.typing import NDArray
 
-from .simplex import parameters_are_feasible
+from .simplex import parameters_are_feasible, projected_gradient_residual
 
 FloatArray = NDArray[np.float64]
 ValueAndGradient = Callable[[FloatArray], tuple[float, FloatArray]]
@@ -28,12 +28,13 @@ def minimize_slsqp(
         raise ValueError("initial parameters must be feasible")
 
     initial_loss, _ = value_and_grad(initial)
+    objective_scale = max(abs(float(initial_loss)), np.finfo(np.float64).eps)
     iterates = [initial.copy()]
     losses = [float(initial_loss)]
 
     def scipy_objective(values: FloatArray) -> tuple[float, FloatArray]:
         loss, gradient = value_and_grad(values)
-        return float(loss), gradient
+        return float(loss) / objective_scale, gradient / objective_scale
 
     def record(values: FloatArray, loss: float) -> None:
         values = np.asarray(values, dtype=np.float64)
@@ -65,8 +66,13 @@ def minimize_slsqp(
     )
     terminal = np.asarray(result.x, dtype=np.float64)
     terminal_loss, terminal_gradient = value_and_grad(terminal)
+    residual = projected_gradient_residual(
+        terminal, terminal_gradient / objective_scale, minimum_gap
+    )
     result.fun = float(terminal_loss)
     result.jac = terminal_gradient
+    result.projected_gradient_residual = residual
+    result.objective_scale = objective_scale
     if parameters_are_feasible(terminal, minimum_gap):
         record(terminal, terminal_loss)
     else:

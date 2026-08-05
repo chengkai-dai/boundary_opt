@@ -28,8 +28,9 @@ def test_backend_solves_active_simplex_quadratic(backend) -> None:
     assert result.iterate_history[:, 1:].min() >= minimum_gap - 1.0e-12
 
 
+@pytest.mark.parametrize("backend", [minimize_slsqp, minimize_spg])
 @pytest.mark.parametrize("scale", [1.0e-4, 1.0, 1.0e4])
-def test_spg_is_robust_to_objective_scaling(scale: float) -> None:
+def test_backend_is_robust_to_objective_scaling(backend, scale: float) -> None:
     minimum_gap = 0.03
     target = np.asarray([0.2, minimum_gap, 0.27, minimum_gap, 0.67])
     initial = np.asarray([0.8, 0.25, 0.25, 0.25, 0.25])
@@ -41,6 +42,6 @@ def test_spg_is_robust_to_objective_scaling(scale: float) -> None:
             scale * difference,
         )
 
-    result = minimize_spg(objective, initial, minimum_gap, 200)
+    result = backend(objective, initial, minimum_gap, 200)
     assert result.success
     np.testing.assert_allclose(result.x, target, atol=2.0e-5)

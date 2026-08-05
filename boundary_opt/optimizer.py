@@ -11,16 +11,22 @@ from numpy.typing import NDArray
 from .boundary import (
     canonical_knots,
     cyclic_boundary_profile,
-    gaps_from_knots,
-    knot_gap_jacobian,
     knots_from_parameters,
     parameters_from_knots,
+)
+from .defaults import (
+    DEFAULT_AREA_WEIGHT,
+    DEFAULT_ISOLINE_WEIGHT,
+    DEFAULT_MAX_ITERATIONS,
+    DEFAULT_MINIMUM_GAP,
+    DEFAULT_UNIFORMITY_WEIGHT,
 )
 from .harmonic import HarmonicField
 from .loss import (
     FieldStatistics,
+    area_balance_loss_and_gradient,
+    isoline_length_loss_and_gradient,
     uniformity_loss_and_gradient,
-    width_loss_and_gradient,
 )
 from .mesh import (
     Mesh,
@@ -46,7 +52,8 @@ class OptimizationResult:
     initial_loss: float
     final_loss: float
     uniformity_loss: float
-    width_loss: float
+    area_loss: float
+    isoline_loss: float
     history: FloatArray
     parameter_history: FloatArray
     parameters: FloatArray
@@ -62,10 +69,11 @@ class OptimizationResult:
 
 
 @dataclass(frozen=True, slots=True)
-class _PhysicalEvaluation:
+class _Evaluation:
     loss: float
     uniformity_loss: float
-    width_loss: float
+    area_loss: float
+    isoline_loss: float
     knot_gradient: FloatArray
     field: FloatArray
     statistics: FieldStatistics
@@ -88,7 +96,8 @@ class _Objective:
 
         self.evaluations += 1
         loss, gradient = self.optimizer._state_loss_and_gradient(
-            parameters, enforce_minimum_gap=False
+            parameters,
+            enforce_minimum_gap=False,
         )
         record = float(loss), np.asarray(gradient, dtype=np.float64)
         self.cache[key] = record
@@ -102,30 +111,33 @@ class BoundaryOptimizer:
         self,
         mesh: Mesh,
         *,
-        minimum_gap: float = 0.03,
-        target_arc_width: float | None = None,
-        width_weight: float = 0.0,
+        minimum_gap: float = DEFAULT_MINIMUM_GAP,
+        uniformity_weight: float = DEFAULT_UNIFORMITY_WEIGHT,
+        area_weight: float = DEFAULT_AREA_WEIGHT,
+        isoline_weight: float = DEFAULT_ISOLINE_WEIGHT,
     ) -> None:
         if not np.isfinite(minimum_gap) or not 0.0 < minimum_gap < 0.25:
             raise ValueError("minimum_gap must lie in (0, 0.25)")
-        if target_arc_width is not None and (
-            not np.isfinite(target_arc_width)
-            or not minimum_gap < target_arc_width < 0.5 - minimum_gap
-        ):
-            raise ValueError(
-                "target_arc_width must lie between minimum_gap and 0.5 - minimum_gap"
-            )
-        if not np.isfinite(width_weight) or width_weight < 0.0:
-            raise ValueError("width_weight must be finite and non-negative")
-        if width_weight > 0.0 and target_arc_width is None:
-            raise ValueError("positive width_weight requires target_arc_width")
+        if not np.isfinite(area_weight) or area_weight < 0.0:
+            raise ValueError("area_weight must be finite and non-negative")
+        if not np.isfinite(uniformity_weight) or uniformity_weight < 0.0:
+            raise ValueError("uniformity_weight must be finite and non-negative")
+        if not np.isfinite(isoline_weight) or isoline_weight < 0.0:
+            raise ValueError("isoline_weight must be finite and non-negative")
 
         self.mesh = mesh
         self.minimum_gap = float(minimum_gap)
-        self.target_arc_width = (
-            None if target_arc_width is None else float(target_arc_width)
+        self.uniformity_weight = float(uniformity_weight)
+        self.area_weight = float(area_weight)
+        self.isoline_weight = float(isoline_weight)
+        self._weight_scale = max(
+            self.uniformity_weight, self.area_weight, self.isoline_weight
         )
-        self.width_weight = float(width_weight)
+        if self._weight_scale == 0.0:
+            raise ValueError("at least one loss weight must be positive")
+        self._relative_weights = np.asarray(
+            [self.uniformity_weight, self.area_weight, self.isoline_weight]
+        ) / self._weight_scale
         self.harmonic = HarmonicField(mesh)
         self.boundary_positions = boundary_arclength(
             mesh.vertices, self.harmonic.boundary_vertices
@@ -134,7 +146,7 @@ class BoundaryOptimizer:
         self.face_areas, self._gradient_basis = face_gradient_basis(mesh)
         self._face_weights = self.face_areas / self.face_areas.sum()
 
-    def _evaluate_knots(self, knots: FloatArray) -> _PhysicalEvaluation:
+    def _evaluate_knots(self, knots: FloatArray) -> _Evaluation:
         boundary_values, profile_jacobian = cyclic_boundary_profile(
             self.boundary_positions, knots
         )
@@ -145,18 +157,33 @@ class BoundaryOptimizer:
             self._gradient_basis,
             self._face_weights,
         )
+        area_loss, area_sensitivity = area_balance_loss_and_gradient(
+            field, self.mesh.faces, self._face_weights
+        )
+        isoline_loss, isoline_sensitivity = isoline_length_loss_and_gradient(
+            field,
+            self.mesh.faces,
+            self._gradient_basis,
+            self._face_weights,
+        )
+        uniformity_weight, area_weight, isoline_weight = self._relative_weights
+        field_sensitivity = (
+            uniformity_weight * field_sensitivity
+            + area_weight * area_sensitivity
+            + isoline_weight * isoline_sensitivity
+        )
         boundary_sensitivity = self.harmonic.solve_adjoint(field_sensitivity)
         knot_gradient = profile_jacobian.T @ boundary_sensitivity
 
-        gaps = gaps_from_knots(knots)
-        width_loss, gap_gradient = width_loss_and_gradient(
-            gaps, self.target_arc_width, self.width_weight
-        )
-        knot_gradient = knot_gradient + knot_gap_jacobian().T @ gap_gradient
-        return _PhysicalEvaluation(
-            loss=uniformity_loss + width_loss,
+        return _Evaluation(
+            loss=(
+                uniformity_weight * uniformity_loss
+                + area_weight * area_loss
+                + isoline_weight * isoline_loss
+            ),
             uniformity_loss=uniformity_loss,
-            width_loss=width_loss,
+            area_loss=area_loss,
+            isoline_loss=isoline_loss,
             knot_gradient=knot_gradient,
             field=field,
             statistics=statistics,
@@ -165,10 +192,16 @@ class BoundaryOptimizer:
     def loss_and_knot_gradient(self, knots: FloatArray) -> tuple[float, FloatArray]:
         """Return total loss and exact gradient with respect to four knots."""
         evaluation = self._evaluate_knots(np.asarray(knots, dtype=np.float64))
-        return evaluation.loss, evaluation.knot_gradient
+        return (
+            self._weight_scale * evaluation.loss,
+            self._weight_scale * evaluation.knot_gradient,
+        )
 
     def _state_loss_and_gradient(
-        self, parameters: FloatArray, *, enforce_minimum_gap: bool
+        self,
+        parameters: FloatArray,
+        *,
+        enforce_minimum_gap: bool,
     ) -> tuple[float, FloatArray]:
         knots, knot_jacobian, _ = knots_from_parameters(
             parameters,
@@ -180,14 +213,17 @@ class BoundaryOptimizer:
 
     def loss_and_gradient(self, parameters: FloatArray) -> tuple[float, FloatArray]:
         """Return loss and gradient in centered-phase full-gap coordinates."""
-        return self._state_loss_and_gradient(parameters, enforce_minimum_gap=True)
+        loss, gradient = self._state_loss_and_gradient(
+            parameters, enforce_minimum_gap=True
+        )
+        return self._weight_scale * loss, self._weight_scale * gradient
 
     def optimize(
         self,
         initial_knots: FloatArray,
         *,
         backend: BackendName = "slsqp",
-        max_iterations: int = 100,
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
         seed: int | None = None,
     ) -> OptimizationResult:
         """Optimize from four knots with the selected interchangeable backend."""
@@ -216,19 +252,21 @@ class BoundaryOptimizer:
         parameter_history = np.asarray(
             solver_result.iterate_history, dtype=np.float64
         ).copy()
-        history = np.asarray(solver_result.loss_history, dtype=np.float64).copy()
+        history = self._weight_scale * np.asarray(
+            solver_result.loss_history, dtype=np.float64
+        )
         initial_loss = float(history[0])
 
         _, final_gradient = objective(final_parameters)
         final_knots, _, final_gaps = knots_from_parameters(
             final_parameters, self.minimum_gap
         )
-        physical = self._evaluate_knots(final_knots)
+        evaluation = self._evaluate_knots(final_knots)
         if np.array_equal(final_parameters, parameter_history[-1]):
-            history[-1] = physical.loss
+            history[-1] = self._weight_scale * evaluation.loss
         else:
             parameter_history = np.vstack((parameter_history, final_parameters))
-            history = np.append(history, physical.loss)
+            history = np.append(history, self._weight_scale * evaluation.loss)
 
         final_parameters[0] %= 1.0
         parameter_history[:, 0] %= 1.0
@@ -239,16 +277,17 @@ class BoundaryOptimizer:
             backend=backend,
             seed=seed,
             initial_loss=float(initial_loss),
-            final_loss=float(physical.loss),
-            uniformity_loss=float(physical.uniformity_loss),
-            width_loss=float(physical.width_loss),
+            final_loss=float(self._weight_scale * evaluation.loss),
+            uniformity_loss=float(evaluation.uniformity_loss),
+            area_loss=float(evaluation.area_loss),
+            isoline_loss=float(evaluation.isoline_loss),
             history=history,
             parameter_history=parameter_history,
             parameters=final_parameters,
             knots=canonical_knots(final_knots),
             gaps=final_gaps,
-            field=physical.field,
-            statistics=physical.statistics,
+            field=evaluation.field,
+            statistics=evaluation.statistics,
             iterations=int(solver_result.nit),
             evaluations=objective.evaluations,
             gradient_norm=float(np.linalg.norm(tangent_gradient)),
@@ -264,7 +303,7 @@ class BoundaryOptimizer:
         self,
         initial_knots: FloatArray,
         *,
-        max_iterations: int = 100,
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
         seed: int | None = None,
     ) -> dict[BackendName, OptimizationResult]:
         """Run both backends from exactly the same physical initialization."""

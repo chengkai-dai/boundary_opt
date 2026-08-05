@@ -9,18 +9,32 @@ from pathlib import Path
 
 import numpy as np
 
-from boundary_opt import BoundaryOptimizer, load_obj, random_knots
+from boundary_opt import (
+    DEFAULT_AREA_WEIGHT,
+    DEFAULT_ISOLINE_WEIGHT,
+    DEFAULT_MAX_ITERATIONS,
+    DEFAULT_MINIMUM_GAP,
+    DEFAULT_UNIFORMITY_WEIGHT,
+    BoundaryOptimizer,
+    load_obj,
+    random_knots,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mesh", type=Path, default=Path("data/disk.obj"))
+    parser.add_argument(
+        "--mesh", choices=("disk", "plane", "triple_peak"), default="disk"
+    )
     parser.add_argument("--backend", choices=("slsqp", "spg"), default="slsqp")
     parser.add_argument("--seeds", type=int, default=16, help="scan seeds [0, N)")
-    parser.add_argument("--iterations", type=int, default=100)
-    parser.add_argument("--minimum-gap", type=float, default=0.03)
-    parser.add_argument("--target-arc-width", type=float)
-    parser.add_argument("--width-weight", type=float, default=0.0)
+    parser.add_argument("--iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
+    parser.add_argument("--minimum-gap", type=float, default=DEFAULT_MINIMUM_GAP)
+    parser.add_argument(
+        "--uniformity-weight", type=float, default=DEFAULT_UNIFORMITY_WEIGHT
+    )
+    parser.add_argument("--area-weight", type=float, default=DEFAULT_AREA_WEIGHT)
+    parser.add_argument("--isoline-weight", type=float, default=DEFAULT_ISOLINE_WEIGHT)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--history-output", type=Path)
     return parser.parse_args()
@@ -31,12 +45,13 @@ def main() -> None:
     if args.seeds < 1:
         raise SystemExit("--seeds must be positive")
     start = time.perf_counter()
-    mesh = load_obj(args.mesh)
+    mesh = load_obj(Path("data") / f"{args.mesh}.obj")
     optimizer = BoundaryOptimizer(
         mesh,
         minimum_gap=args.minimum_gap,
-        target_arc_width=args.target_arc_width,
-        width_weight=args.width_weight,
+        uniformity_weight=args.uniformity_weight,
+        area_weight=args.area_weight,
+        isoline_weight=args.isoline_weight,
     )
     setup_seconds = time.perf_counter() - start
     print(
@@ -59,7 +74,7 @@ def main() -> None:
         optimize_seconds = time.perf_counter() - start
         reduction = 1.0 - result.final_loss / result.initial_loss
         row: dict[str, int | float | str] = {
-            "mesh": str(args.mesh),
+            "mesh": args.mesh,
             "backend": args.backend,
             "vertices": len(mesh.vertices),
             "faces": len(mesh.faces),
@@ -67,12 +82,14 @@ def main() -> None:
             "setup_seconds": setup_seconds,
             "seed": seed,
             "minimum_gap": args.minimum_gap,
-            "target_arc_width": args.target_arc_width,
-            "width_weight": args.width_weight,
+            "uniformity_weight": args.uniformity_weight,
+            "area_weight": args.area_weight,
+            "isoline_weight": args.isoline_weight,
             "initial_loss": result.initial_loss,
             "final_loss": result.final_loss,
             "uniformity_loss": result.uniformity_loss,
-            "width_loss": result.width_loss,
+            "area_loss": result.area_loss,
+            "isoline_loss": result.isoline_loss,
             "reduction": reduction,
             "iterations": result.iterations,
             "evaluations": result.evaluations,
@@ -109,13 +126,15 @@ def main() -> None:
             f"backend={args.backend} seed={seed:02d} loss "
             f"{result.initial_loss:.6f} -> {result.final_loss:.6f} "
             f"({100.0 * reduction:6.2f}%) uniform={result.uniformity_loss:.6f} "
-            f"width={result.width_loss:.6f} cv={result.statistics.spacing_cv:.4f} "
+            f"area={result.area_loss:.6f} "
+            f"isoline={result.isoline_loss:.6f} "
+            f"cv={result.statistics.spacing_cv:.4f} "
             f"iter={result.iterations:02d} kkt={result.kkt_residual:.2e} "
             f"time={optimize_seconds:.4f}s"
         )
 
     output = args.output or Path("output") / (
-        f"{args.mesh.stem}_{args.backend}_seed_scan.csv"
+        f"{args.mesh}_{args.backend}_seed_scan.csv"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="", encoding="utf-8") as stream:

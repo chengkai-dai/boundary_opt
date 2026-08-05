@@ -6,9 +6,28 @@ from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.special import expit, ndtr
 
 FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int64]
+
+_FIELD_LEVELS = np.linspace(0.05, 0.95, 19)
+_AREA_SMOOTHING = 0.01
+_AREA_TARGET = _AREA_SMOOTHING * (
+    np.logaddexp(0.0, _FIELD_LEVELS / _AREA_SMOOTHING)
+    - np.logaddexp(0.0, (_FIELD_LEVELS - 1.0) / _AREA_SMOOTHING)
+)
+_ISOLINE_SMOOTHING = 0.03
+_ISOLINE_KERNEL_MASS = ndtr((1.0 - _FIELD_LEVELS) / _ISOLINE_SMOOTHING) - ndtr(
+    -_FIELD_LEVELS / _ISOLINE_SMOOTHING
+)
+_TRIANGLE_QUADRATURE = np.asarray(
+    [
+        [2.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0],
+        [1.0 / 6.0, 2.0 / 3.0, 1.0 / 6.0],
+        [1.0 / 6.0, 1.0 / 6.0, 2.0 / 3.0],
+    ]
+)
 
 
 class DegenerateFieldError(ValueError):
@@ -63,13 +82,83 @@ def uniformity_loss_and_gradient(
     return float(loss), field_sensitivity, statistics
 
 
-def width_loss_and_gradient(
-    gaps: FloatArray, target: float | None, weight: float
+def area_balance_loss_and_gradient(
+    field: FloatArray,
+    faces: IntArray,
+    face_weights: FloatArray,
 ) -> tuple[float, FloatArray]:
-    """Optional quadratic prior on the zero and one plateau widths."""
-    if weight == 0.0 or target is None:
-        return 0.0, np.zeros(4, dtype=np.float64)
-    residual = (np.asarray(gaps)[[0, 2]] - target) / target
-    gradient = np.zeros(4, dtype=np.float64)
-    gradient[[0, 2]] = 2.0 * weight * residual / target
-    return weight * float(residual @ residual), gradient
+    """Match the field's area-weighted CDF to a uniform distribution."""
+    face_values = np.asarray(field, dtype=np.float64)[faces].mean(axis=1)
+    sigmoid = expit((_FIELD_LEVELS[None, :] - face_values[:, None]) / _AREA_SMOOTHING)
+    cdf = face_weights @ sigmoid
+    residual = cdf - _AREA_TARGET
+    loss = float(np.mean(residual**2))
+
+    cdf_gradient = 2.0 * residual / len(_FIELD_LEVELS)
+    face_gradient = (
+        -face_weights / _AREA_SMOOTHING * ((sigmoid * (1.0 - sigmoid)) @ cdf_gradient)
+    )
+    field_gradient = np.bincount(
+        faces.reshape(-1),
+        weights=np.repeat(face_gradient / 3.0, 3),
+        minlength=len(field),
+    ).astype(np.float64)
+    return loss, field_gradient
+
+
+def isoline_length_loss_and_gradient(
+    field: FloatArray,
+    faces: IntArray,
+    gradient_basis: FloatArray,
+    face_weights: FloatArray,
+) -> tuple[float, FloatArray]:
+    """Equalize differentiable coarea estimates of neighboring isoline lengths."""
+    face_values = np.asarray(field, dtype=np.float64)[faces]
+    gradients = np.einsum("fij,fi->fj", gradient_basis, face_values)
+    gradient_norms = np.sqrt(np.einsum("ij,ij->i", gradients, gradients) + 1.0e-24)
+
+    samples = face_values @ _TRIANGLE_QUADRATURE.T
+    offsets = samples[:, :, None] - _FIELD_LEVELS
+    kernels = (
+        np.exp(-0.5 * (offsets / _ISOLINE_SMOOTHING) ** 2)
+        / (np.sqrt(2.0 * np.pi) * _ISOLINE_SMOOTHING)
+        / _ISOLINE_KERNEL_MASS
+    )
+    mean_kernels = kernels.mean(axis=1)
+    lengths = (face_weights * gradient_norms) @ mean_kernels
+
+    differences = np.diff(lengths)
+    numerator = float(np.mean(differences**2))
+    mean_length = float(lengths.mean())
+    denominator = mean_length**2 + 1.0e-15
+    loss = numerator / denominator
+
+    length_gradient = np.zeros_like(lengths)
+    difference_gradient = 2.0 * differences / len(differences)
+    length_gradient[:-1] -= difference_gradient
+    length_gradient[1:] += difference_gradient
+    length_gradient = (
+        length_gradient / denominator
+        - numerator * (2.0 * mean_length / len(lengths)) / denominator**2
+    )
+
+    kernel_derivatives = -offsets / _ISOLINE_SMOOTHING**2 * kernels
+    sample_sensitivity = (
+        face_weights[:, None]
+        * gradient_norms[:, None]
+        * np.einsum("fql,l->fq", kernel_derivatives, length_gradient)
+        / len(_TRIANGLE_QUADRATURE)
+    )
+    corner_sensitivity = sample_sensitivity @ _TRIANGLE_QUADRATURE
+
+    norm_sensitivity = face_weights * (mean_kernels @ length_gradient)
+    gradient_sensitivity = (
+        norm_sensitivity[:, None] * gradients / gradient_norms[:, None]
+    )
+    corner_sensitivity += np.einsum("fij,fj->fi", gradient_basis, gradient_sensitivity)
+    field_gradient = np.bincount(
+        faces.reshape(-1),
+        weights=corner_sensitivity.reshape(-1),
+        minlength=len(field),
+    ).astype(np.float64)
+    return float(loss), field_gradient
