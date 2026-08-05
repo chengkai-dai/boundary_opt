@@ -12,9 +12,9 @@ theta2 -- 1 plateau -- theta3 -- linear fall -- theta0 + 1
 ```
 
 The interior field is the cotangent-harmonic extension of this trace. The loss
-can combine gradient uniformity, area balance, and a differentiable estimate
-of neighboring isoline-length differences. One prefactorization, one forward
-solve, and one adjoint solve provide the exact gradient for each evaluation.
+combines optional gradient uniformity with a differentiable estimate of
+neighboring isoline-length changes. One prefactorization, one forward solve,
+and one adjoint solve provide the exact gradient for each evaluation.
 
 ## Architecture
 
@@ -25,7 +25,7 @@ boundary_opt/
   harmonic.py         prefactorized harmonic solve and adjoint
   boundary.py         knots, gaps, boundary profile, coordinate conversion
   simplex.py          feasibility, projection, projected-gradient residual
-  loss.py             gradient, area, and soft isoline-length losses
+  loss.py             gradient uniformity and length-smoothness losses
   slsqp_backend.py    one constrained SciPy SLSQP solve
   spg_backend.py      spectral projected gradient + nonmonotone Armijo
   optimizer.py        objective assembly, evaluation cache, backend dispatch
@@ -82,14 +82,12 @@ The objective is
 
 ```text
 total = (uniformity_weight * uniformity_loss
-         + area_weight * area_loss
          + length_smoothness_weight * length_smoothness_loss)
 ```
 
-The corresponding constants in `defaults.py` supply the defaults. Area loss
-is retained but disabled by default. Only weight ratios affect the optimizer:
-multiplying all three weights by one positive constant scales the reported
-total and history, but leaves the optimization path unchanged. SLSQP also
+The corresponding constants in `defaults.py` supply the defaults. Only weight
+ratios affect the optimizer: multiplying both weights by one positive constant
+scales the reported total and history, but leaves the optimization path unchanged. SLSQP also
 divides its numerical objective by the initial loss so its absolute `ftol`
 does not leak into the model. The public result contains every raw loss
 component, the optimized `knots`, four physical `gaps`, harmonic `field`,
@@ -149,7 +147,6 @@ coordinates, SLSQP, and SPG, see
   is only piecewise smooth when a knot crosses a boundary vertex.
 - A discretely constant field makes the scale-free CV loss undefined and raises
   `DegenerateFieldError`.
-- Area balance uses a smooth CDF sampled at 19 fixed field levels.
 - Length smoothness uses Gaussian soft-isoline estimates and three-point triangle
   quadrature;
   it is differentiable but still resolution- and bandwidth-dependent.

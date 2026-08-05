@@ -55,14 +55,11 @@ flowchart LR
     K --> Z["完整边界 trace z"]
     Z --> U["harmonic solve: u = Ez"]
     U --> G["每个三角形的 ∇u"]
-    U --> A["area CDF Fσ(t)"]
     U --> I["soft isoline lengths"]
     G --> LG["gradient uniformity"]
     G --> I
-    A --> LA["area balance"]
     I --> LI["length smoothness loss"]
     LG --> L["weighted total loss"]
-    LA --> L
     LI --> L
     L -. "field sensitivity" .-> U
     U -. "adjoint Eᵀ" .-> Z
@@ -291,7 +288,7 @@ S=K_{BB}-K_{BI}K_{II}^{-1}K_{IB},
 
 ---
 
-## 7. 三个 loss 究竟测量什么？
+## 7. 两个 loss 究竟测量什么？
 
 P1 field 在每个三角形 \(f\) 内有常梯度。记
 
@@ -347,56 +344,7 @@ du\approx\lVert\nabla u\rVert\,d\ell.
 因此梯度模长越均匀，固定 value increment 的局部 isoline spacing 越均匀。但这仍是
 proxy：它不直接测整条等值线之间的 geodesic distance，也不评价等值线形状和拓扑。
 
-### 7.2 Area balance：控制场值的面积分布
-
-令
-
-\[
-A(t)=\operatorname{Area}\{x\in M:u(x)\le t\}.
-\]
-
-阈值从 \(t\) 增加到 \(t+dt\) 时，isoline 上长度为 \(ds\) 的小段沿法向移动
-\(dt/|\nabla u|\)，因此 coarea formula 给出
-
-\[
-\frac{dA}{dt}
-=\int_{\Gamma_t}\frac{1}{|\nabla u|}\,ds,
-\qquad \Gamma_t=\{x:u(x)=t\}.
-\]
-
-已有的 uniformity loss 使 \(|\nabla u|\) 接近常数，所以等值区间覆盖相同面积时，相邻
-isoline 的长度也接近相同。代码使用归一化面积 CDF
-
-\[
-F_\sigma(t_j)
-=\sum_f w_f\,
-S\!\left(\frac{t_j-\bar u_f}{\sigma}\right),
-\]
-
-其中 \(S\) 是 sigmoid，\(\bar u_f\) 是 face 三个顶点值的平均。目标是平滑后的 uniform
-distribution CDF：
-
-\[
-F_\sigma^{\mathrm{uniform}}(t)
-=\sigma\left[
-\operatorname{softplus}\!\left(\frac{t}{\sigma}\right)
--\operatorname{softplus}\!\left(\frac{t-1}{\sigma}\right)
-\right].
-\]
-
-最终定义
-
-\[
-L_{\mathrm{area}}
-=\frac1m\sum_{j=1}^m
-\left(F_\sigma(t_j)-F_\sigma^{\mathrm{uniform}}(t_j)\right)^2.
-\]
-
-当前使用 \(t_j=0.05,0.10,\ldots,0.95\) 和 \(\sigma=0.01\)。它不提取 contour，处处可微，
-解析 field gradient 位于
-[`area_balance_loss_and_gradient`](boundary_opt/loss.py)。
-
-### 7.3 Soft isoline-length：直接比较等值线长度
+### 7.2 Soft isoline-length：直接比较等值线长度
 
 真实等值线长度可以用 coarea identity 写成
 
@@ -431,11 +379,11 @@ L_{\mathrm{smooth}}
 就自动变小。它惩罚相邻 knitting courses 突然变长或缩短，但不要求所有 courses
 具有同一个绝对长度。
 
-这仍不需要显式提取 contour，但与 area CDF 不同，它通过 \(|\nabla u|\) 消掉了 coarea
-公式里的 reciprocal-gradient 因子，因此直接估计长度。实现位于
+这不需要显式提取 contour；\(|\nabla u|\) 把窄带面积转换为曲线长度，因此直接估计
+course 长度。实现位于
 [`length_smoothness_loss_and_gradient`](boundary_opt/loss.py)。
 
-### 7.4 Loss 自身不保证“从 0 到 1”
+### 7.3 Loss 自身不保证“从 0 到 1”
 
 由于 scale invariance，几乎常值但相对均匀的场也可能得到很低的 CV loss。当前模型的
 0 与 1 来自完整边界 profile，而不是 uniformity loss。
@@ -459,12 +407,11 @@ L_{\mathrm{smooth}}
 
 \[
 L=\lambda_{\mathrm{uniform}}L_{\mathrm{uniform}}
-+\lambda_{\mathrm{area}}L_{\mathrm{area}}
 +\lambda_{\mathrm{smooth}}L_{\mathrm{smooth}}.
 \]
 
-默认值统一位于 `defaults.py`。Area loss 保留，但默认权重为零。三个权重只有相对比例
-影响优化路径：把它们同时乘以任意正数，只会等比例缩放公开报告的 total loss 与 history，
+默认值统一位于 `defaults.py`。两个权重只有相对比例影响优化路径：把它们同时乘以任意正数，
+只会等比例缩放公开报告的 total loss 与 history，
 不会改变 knots。实现中先除以最大权重，再组装 adjoint sensitivity，避免整体数值尺度泄漏
 进 backend。
 
@@ -517,27 +464,12 @@ L=\frac{m_2}{\mu^2}-1
 \end{bmatrix}.
 \]
 
-Area loss 的导数同样直接。若
-
-\[
-S_{fj}=S\!\left(\frac{t_j-\bar u_f}{\sigma}\right),
-\]
-
-则
-
-\[
-\frac{\partial F_\sigma(t_j)}{\partial \bar u_f}
-=-\frac{w_f}{\sigma}S_{fj}(1-S_{fj}).
-\]
-
-再把每个 face-center sensitivity 均分到三个顶点。总 field sensitivity 是
+总 field sensitivity 是
 
 \[
 \boldsymbol s
 =\lambda_{\mathrm{uniform}}
 \frac{\partial L_{\mathrm{uniform}}}{\partial\boldsymbol u}
-+\lambda_{\mathrm{area}}
-\frac{\partial L_{\mathrm{area}}}{\partial\boldsymbol u}
 +\lambda_{\mathrm{smooth}}
 \frac{\partial L_{\mathrm{smooth}}}{\partial\boldsymbol u}.
 \]
@@ -954,21 +886,13 @@ face 的梯度完全相同，于是
 L_{\mathrm{uniform}}=0.
 \]
 
-同时 \(u\) 在矩形面积上的分布严格 uniform，所以连续模型中
-
-\[
-F(t)=t,
-\qquad
-L_{\mathrm{area}}=0.
-\]
-
 每条内部等值线都是等长直线，所以
 
 \[
 L_{\mathrm{smooth}}=0.
 \]
 
-三个 loss 都非负，因此四角解是连续模型的 global optimum。离散 length smoothness loss
+两个 loss 都非负，因此四角解是连续模型的 global optimum。离散 length smoothness loss
 使用三点 triangle quadrature；当前 Plane 四角场上的 raw loss 约为
 \(4.5\times10^{-9}\)。
 
@@ -1155,7 +1079,6 @@ g_i\ge\delta,
 \qquad
 L=\lambda_{\mathrm{uniform}}
 \operatorname{CV}_{A}^{2}(\lVert\nabla u\rVert^2)
-+\lambda_{\mathrm{area}}L_{\mathrm{area}}
 +\lambda_{\mathrm{smooth}}L_{\mathrm{smooth}}
 }
 \]

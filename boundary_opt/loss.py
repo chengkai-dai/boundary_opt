@@ -6,18 +6,13 @@ from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.special import expit, ndtr
+from scipy.special import ndtr
 
 FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int64]
 
 _FIELD_LEVELS = np.linspace(0.05, 0.95, 19)
 _FIELD_LEVEL_STEPS = np.diff(_FIELD_LEVELS)
-_AREA_SMOOTHING = 0.01
-_AREA_TARGET = _AREA_SMOOTHING * (
-    np.logaddexp(0.0, _FIELD_LEVELS / _AREA_SMOOTHING)
-    - np.logaddexp(0.0, (_FIELD_LEVELS - 1.0) / _AREA_SMOOTHING)
-)
 _ISOLINE_SMOOTHING = 0.03
 _ISOLINE_KERNEL_MASS = ndtr((1.0 - _FIELD_LEVELS) / _ISOLINE_SMOOTHING) - ndtr(
     -_FIELD_LEVELS / _ISOLINE_SMOOTHING
@@ -81,30 +76,6 @@ def uniformity_loss_and_gradient(
         maximum_gradient=float(norms.max()),
     )
     return float(loss), field_sensitivity, statistics
-
-
-def area_balance_loss_and_gradient(
-    field: FloatArray,
-    faces: IntArray,
-    face_weights: FloatArray,
-) -> tuple[float, FloatArray]:
-    """Match the field's area-weighted CDF to a uniform distribution."""
-    face_values = np.asarray(field, dtype=np.float64)[faces].mean(axis=1)
-    sigmoid = expit((_FIELD_LEVELS[None, :] - face_values[:, None]) / _AREA_SMOOTHING)
-    cdf = face_weights @ sigmoid
-    residual = cdf - _AREA_TARGET
-    loss = float(np.mean(residual**2))
-
-    cdf_gradient = 2.0 * residual / len(_FIELD_LEVELS)
-    face_gradient = (
-        -face_weights / _AREA_SMOOTHING * ((sigmoid * (1.0 - sigmoid)) @ cdf_gradient)
-    )
-    field_gradient = np.bincount(
-        faces.reshape(-1),
-        weights=np.repeat(face_gradient / 3.0, 3),
-        minlength=len(field),
-    ).astype(np.float64)
-    return loss, field_gradient
 
 
 def length_smoothness_loss_and_gradient(

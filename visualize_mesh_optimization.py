@@ -8,7 +8,6 @@ from pathlib import Path
 import numpy as np
 
 from boundary_opt import (
-    DEFAULT_AREA_WEIGHT,
     DEFAULT_LENGTH_SMOOTHNESS_WEIGHT,
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_MINIMUM_GAP,
@@ -37,7 +36,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--uniformity-weight", type=float, default=DEFAULT_UNIFORMITY_WEIGHT
     )
-    parser.add_argument("--area-weight", type=float, default=DEFAULT_AREA_WEIGHT)
     parser.add_argument(
         "--length-smoothness-weight",
         type=float,
@@ -349,7 +347,6 @@ def main() -> None:
         mesh,
         minimum_gap=args.minimum_gap,
         uniformity_weight=args.uniformity_weight,
-        area_weight=args.area_weight,
         length_smoothness_weight=args.length_smoothness_weight,
     )
     initial_knots = random_knots(args.seed, args.minimum_gap)

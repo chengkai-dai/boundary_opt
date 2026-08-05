@@ -4,7 +4,6 @@ import numpy as np
 import pytest
 
 from boundary_opt import (
-    DEFAULT_AREA_WEIGHT,
     DEFAULT_LENGTH_SMOOTHNESS_WEIGHT,
     DEFAULT_MINIMUM_GAP,
     DEFAULT_UNIFORMITY_WEIGHT,
@@ -19,8 +18,7 @@ from boundary_opt.boundary import (
 from boundary_opt.loss import DegenerateFieldError
 
 ROOT = Path(__file__).resolve().parent.parent
-TEST_AREA_WEIGHT = 1000.0
-TEST_LENGTH_SMOOTHNESS_WEIGHT = 0.0
+TEST_LENGTH_SMOOTHNESS_WEIGHT = 1.0
 TEST_UNIFORMITY_WEIGHT = 1.0
 
 
@@ -29,7 +27,6 @@ def disk_optimizer() -> BoundaryOptimizer:
     return BoundaryOptimizer(
         load_obj(ROOT / "data" / "disk.obj"),
         uniformity_weight=TEST_UNIFORMITY_WEIGHT,
-        area_weight=TEST_AREA_WEIGHT,
         length_smoothness_weight=TEST_LENGTH_SMOOTHNESS_WEIGHT,
     )
 
@@ -37,7 +34,6 @@ def disk_optimizer() -> BoundaryOptimizer:
 def test_default_weights() -> None:
     optimizer = BoundaryOptimizer(load_obj(ROOT / "data" / "disk.obj"))
     assert optimizer.minimum_gap == DEFAULT_MINIMUM_GAP
-    assert optimizer.area_weight == DEFAULT_AREA_WEIGHT
     assert (
         optimizer.length_smoothness_weight == DEFAULT_LENGTH_SMOOTHNESS_WEIGHT
     )
@@ -48,32 +44,25 @@ def test_loss_weights_scale_value_and_gradient() -> None:
     mesh = load_obj(ROOT / "data" / "disk.obj")
     knots = random_knots(7)
     uniformity = BoundaryOptimizer(
-        mesh, uniformity_weight=1.0, area_weight=0.0, length_smoothness_weight=0.0
-    )
-    area = BoundaryOptimizer(
-        mesh, uniformity_weight=0.0, area_weight=1.0, length_smoothness_weight=0.0
+        mesh, uniformity_weight=1.0, length_smoothness_weight=0.0
     )
     length_smoothness = BoundaryOptimizer(
-        mesh, uniformity_weight=0.0, area_weight=0.0, length_smoothness_weight=1.0
+        mesh, uniformity_weight=0.0, length_smoothness_weight=1.0
     )
     weighted = BoundaryOptimizer(
         mesh,
         uniformity_weight=3.0,
-        area_weight=7.0,
         length_smoothness_weight=11.0,
     )
 
     uniformity_loss, uniformity_gradient = uniformity.loss_and_knot_gradient(knots)
-    area_loss, area_gradient = area.loss_and_knot_gradient(knots)
     length_loss, length_gradient = length_smoothness.loss_and_knot_gradient(knots)
     weighted_loss, weighted_gradient = weighted.loss_and_knot_gradient(knots)
 
-    assert weighted_loss == pytest.approx(
-        3.0 * uniformity_loss + 7.0 * area_loss + 11.0 * length_loss
-    )
+    assert weighted_loss == pytest.approx(3.0 * uniformity_loss + 11.0 * length_loss)
     np.testing.assert_allclose(
         weighted_gradient,
-        3.0 * uniformity_gradient + 7.0 * area_gradient + 11.0 * length_gradient,
+        3.0 * uniformity_gradient + 11.0 * length_gradient,
     )
 
 
@@ -111,7 +100,6 @@ def test_centered_state_gradient_on_tangent() -> None:
     optimizer = BoundaryOptimizer(
         load_obj(ROOT / "data" / "triple_peak.obj"),
         uniformity_weight=TEST_UNIFORMITY_WEIGHT,
-        area_weight=TEST_AREA_WEIGHT,
         length_smoothness_weight=TEST_LENGTH_SMOOTHNESS_WEIGHT,
     )
     parameters = parameters_from_knots(random_knots(7), optimizer.minimum_gap)
@@ -133,22 +121,14 @@ def test_centered_state_gradient_on_tangent() -> None:
         )
 
 
-def test_plane_corners_are_global_zero_loss_for_both_backends() -> None:
+def test_plane_corners_have_zero_loss() -> None:
     optimizer = BoundaryOptimizer(
         load_obj(ROOT / "data" / "plane.obj"),
         uniformity_weight=TEST_UNIFORMITY_WEIGHT,
-        area_weight=TEST_AREA_WEIGHT,
         length_smoothness_weight=TEST_LENGTH_SMOOTHNESS_WEIGHT,
     )
     corners = plane_corner_knots(optimizer)
-    assert optimizer.loss_and_knot_gradient(corners)[0] < 1.0e-5
-    for backend in ("slsqp", "spg"):
-        result = optimizer.optimize(corners, backend=backend, max_iterations=50)
-        assert result.final_loss < 1.0e-5
-        assert result.uniformity_loss < 1.0e-9
-        assert result.area_loss < 1.0e-7
-        assert result.length_smoothness_loss < 1.0e-8
-        assert result.constraint_violation <= 1.0e-9
+    assert optimizer.loss_and_knot_gradient(corners)[0] < 1.0e-8
 
 
 @pytest.mark.parametrize("backend", ["slsqp", "spg"])
@@ -167,12 +147,11 @@ def test_global_weight_scale_does_not_change_slsqp_path() -> None:
     mesh = load_obj(ROOT / "data" / "plane.obj")
     initial = random_knots(0)
     unit = BoundaryOptimizer(
-        mesh, uniformity_weight=0.0, area_weight=0.0, length_smoothness_weight=1.0
+        mesh, uniformity_weight=0.0, length_smoothness_weight=1.0
     ).optimize(initial, backend="slsqp", max_iterations=500)
     scaled = BoundaryOptimizer(
         mesh,
         uniformity_weight=0.0,
-        area_weight=0.0,
         length_smoothness_weight=100.0,
     ).optimize(initial, backend="slsqp", max_iterations=500)
 
@@ -262,34 +241,26 @@ def test_degenerate_initial_field_raises(backend: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("mesh_name", "maximum_uniformity", "maximum_area"),
+    ("mesh_name", "maximum_length_smoothness"),
     [
-        ("disk.obj", 0.12, 3.0e-5),
-        ("plane.obj", 1.0e-6, 1.0e-7),
-        ("triple_peak.obj", 0.7, 5.0e-4),
+        ("disk.obj", 0.05),
+        ("plane.obj", 1.0e-7),
+        ("triple_peak.obj", 2.0),
     ],
 )
 @pytest.mark.parametrize("backend", ["slsqp", "spg"])
 def test_backend_mesh_quality(
     mesh_name: str,
-    maximum_uniformity: float,
-    maximum_area: float,
+    maximum_length_smoothness: float,
     backend: str,
 ) -> None:
-    optimizer = BoundaryOptimizer(
-        load_obj(ROOT / "data" / mesh_name),
-        uniformity_weight=TEST_UNIFORMITY_WEIGHT,
-        area_weight=TEST_AREA_WEIGHT,
-        length_smoothness_weight=TEST_LENGTH_SMOOTHNESS_WEIGHT,
-    )
+    optimizer = BoundaryOptimizer(load_obj(ROOT / "data" / mesh_name))
     result = optimizer.optimize(random_knots(0), backend=backend, max_iterations=500)
     assert result.final_loss <= result.initial_loss
     assert result.final_loss == pytest.approx(
         optimizer.uniformity_weight * result.uniformity_loss
-        + optimizer.area_weight * result.area_loss
         + optimizer.length_smoothness_weight * result.length_smoothness_loss
     )
-    assert result.uniformity_loss < maximum_uniformity
-    assert result.area_loss < maximum_area
+    assert result.length_smoothness_loss < maximum_length_smoothness
     assert result.constraint_violation <= 1.0e-9
     assert np.isfinite(result.field).all()

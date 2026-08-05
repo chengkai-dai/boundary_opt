@@ -2,7 +2,6 @@
 
 from .boundary import random_knots
 from .defaults import (
-    DEFAULT_AREA_WEIGHT,
     DEFAULT_LENGTH_SMOOTHNESS_WEIGHT,
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_MINIMUM_GAP,
@@ -17,7 +16,6 @@ from .optimizer import (
 )
 
 __all__ = [
-    "DEFAULT_AREA_WEIGHT",
     "DEFAULT_LENGTH_SMOOTHNESS_WEIGHT",
     "DEFAULT_MAX_ITERATIONS",
     "DEFAULT_MINIMUM_GAP",
