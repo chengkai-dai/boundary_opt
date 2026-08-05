@@ -1,92 +1,100 @@
-# 从零理解线性全边界 Harmonic Boundary Optimization
+# 从零理解 Harmonic Boundary Optimization
 
-本文只解释 [`boundary_opt.py`](boundary_opt.py) 中保留的 **linear
-all-boundary Dirichlet** 版本。它和
-[`continuous_partial_opt.py`](continuous_partial_opt.py) 的 partial-Dirichlet / Wentzell
-版本是两个不同的数学模型，不要混在一起理解或直接比较实现细节。
+本文解释当前 [`boundary_opt/`](boundary_opt/) package 中的完整线性边界版本。目标是：
 
-如果只记一句话，可以记住：
+> 用边界环上的四个连续端点定义一个完整的 \(0\to1\to0\) 分片线性边界函数，求它在
+> 三角网格内部的 harmonic extension，再移动四个端点，让场的梯度尽量均匀。
 
-> 四个连续参数先规定整条边界上的完整 \(0\to1\to0\) 分片线性函数，再对内部顶点做
-> harmonic extension；优化器通过解析伴随梯度移动这四个参数，使网格内部的场梯度尽量
-> 均匀。
-
-它最简洁的数学摘要是
+整个问题可以压缩成三行：
 
 \[
-\boldsymbol z=g(\boldsymbol\theta(\boldsymbol p)),\qquad
-\boldsymbol u=E\boldsymbol z,\qquad
+\boldsymbol z=h_{\boldsymbol\theta}(\boldsymbol\xi),
+\qquad
+\boldsymbol u=E\boldsymbol z,
+\qquad
 L=\operatorname{CV}_{A}^{2}\!\left(\lVert\nabla u\rVert^2\right).
 \]
 
 这里：
 
-- \(\boldsymbol p\in\mathbb R^4\) 是真正交给优化器的四个变量；
-- \(\boldsymbol\theta\) 是边界环上的四个有序 knots；
-- \(\boldsymbol z\) 是所有边界顶点的已知 Dirichlet 值；
-- \(\boldsymbol u\) 是整个 mesh 上由线性方程自动求出的 harmonic field；
-- \(E\) 是 harmonic extension operator，代码不会显式构造这个大矩阵。
+- \(\boldsymbol\theta=(\theta_0,\theta_1,\theta_2,\theta_3)\) 是真正有物理意义的四个
+  boundary endpoints；
+- \(\boldsymbol z\) 是所有边界顶点上的已知值；
+- \(\boldsymbol u\) 是整个 mesh 上的 harmonic field；
+- \(E\) 是 harmonic extension operator，代码只隐式应用它，不构造稠密矩阵；
+- 外层优化使用四个独立自由度。实现为了对四个 gap 完全对称，保存五个坐标并施加一个
+  线性等式。
 
 ---
 
-## 1. 首先区分“设计变量”“边界值”和“场”
+## 1. 先分清四层变量
 
-这三个概念很容易混淆：
+最容易混淆的是“端点”“边界值”和“内部场”。它们不是同一组未知量。
 
-| 名称 | 数量 | 是否被外层直接优化 | 来源 |
-|---|---:|---|---|
-| 参数 \(\boldsymbol p=(o,g_0,g_1,g_2)\) | 4 | 是 | constrained SLSQP |
-| knots \(\boldsymbol\theta\) | 4 | 间接 | 由 offset 与累计 gaps 得到 |
-| 边界 trace \(\boldsymbol z\) | 边界顶点数 \(B\) | 否 | 由四个 knots 的分片线性 profile 生成 |
-| harmonic field \(\boldsymbol u\) | 总顶点数 \(V\) | 否 | 每次通过线性系统求解 |
+| 名称 | 存储数量 | 独立自由度 | 如何得到 |
+|---|---:|---:|---|
+| 优化状态 \(\boldsymbol p=(c,g_0,g_1,g_2,g_3)\) | 5 | 4 | 后端在约束集上更新 |
+| 四个 knots \(\boldsymbol\theta\) | 4 | 4 | 由中心相位和 gaps 计算 |
+| 边界 trace \(\boldsymbol z\) | 边界顶点数 \(B\) | 0 | 在边界顶点处采样 profile |
+| harmonic field \(\boldsymbol u\) | 总顶点数 \(V\) | 0 | 每次通过固定线性系统求解 |
 
-虽然最后有几千个甚至更多的 \(u_i\)，外层问题始终只有四维。内部场不是通过 Adam
-逐个更新出来的，而是给定四个参数后一次性解出来的。
+五个状态坐标满足
+
+\[
+g_i\ge\delta,
+\qquad
+\sum_{i=0}^{3}g_i=1.
+\]
+
+因此四个 gap 虽然全部显式存储，却只有三个独立自由度；再加一个中心相位 \(c\)，总共
+仍然是四个自由度，也就是四个循环端点的自由度。
 
 ```mermaid
 flowchart LR
-    P["四个参数 p"] --> K["有序 knots θ 与四个 gaps"]
+    P["中心相位 c + 四个完整 gaps"] --> K["四个有序 knots θ"]
     K --> Z["完整边界 trace z"]
     Z --> U["harmonic solve: u = Ez"]
     U --> G["每个三角形的 ∇u"]
     G --> L["uniformity loss L"]
-    L -. "adjoint gradient" .-> U
-    U -. "Eᵀ" .-> Z
-    Z -. "chain rule" .-> K
-    K -. "chain rule" .-> P
+    L -. "field sensitivity" .-> U
+    U -. "adjoint Eᵀ" .-> Z
+    Z -. "profile Jacobian" .-> K
+    K -. "parameter Jacobian" .-> P
 ```
+
+内部顶点值不是被 Adam 或其他高维优化器逐个更新的。给定四个 endpoints 后，它们由
+harmonic 方程一次性确定。
 
 ---
 
-## 2. 把一圈边界变成一条周期坐标轴
+## 2. 把任意边界环变成周期坐标轴
 
-程序首先找出 mesh 唯一的 manifold boundary loop，并按照环上的顺序排列边界顶点。
-设边界总周长为 \(P\)，从起点沿边界走过的物理弧长为 \(s\)，定义归一化弧长
+程序先找出 mesh 的唯一 manifold boundary loop，并按环上顺序排列边界顶点。设边界总
+周长为 \(P\)，从选定起点沿边界走过的三维弧长为 \(s\)，定义
 
 \[
 \xi=\frac{s}{P}\in[0,1).
 \]
 
-也可以把它显示成角度
+也可以使用角度表示：
 
 \[
 \phi=2\pi\xi\in[0,2\pi).
 \]
 
-这里的 \(\phi\) **不是 mesh 在三维空间中的极角**。它只是把任意形状的一圈边界
-摊成一个周期为 1 或 \(2\pi\) 的坐标轴，所以同样适用于 Disk、Plane 和弯曲的
-Triple Peak。
+这里的 \(\phi\) 不是三维空间中的极角，只是归一化边界弧长。换句话说，Disk、Plane
+或弯曲曲面都被统一摊成一条首尾相接的周期坐标轴。
 
-对应代码是：
+对应实现位于 [`boundary_opt/mesh.py`](boundary_opt/mesh.py)：
 
-- [`boundary_loop`](boundary_opt.py#L103)：找到唯一边界环；
-- [`boundary_arclength`](boundary_opt.py#L144)：计算三维边长和归一化累计弧长。
+- `boundary_loop` 找出并排序边界环；
+- `boundary_arclength` 用三维边长计算归一化累计弧长。
 
 ---
 
-## 3. 四个 knots 到底定义了什么？
+## 3. 四个 knots 定义了什么？
 
-令四个连续 knots 满足
+使用一组 unwrapped knots：
 
 \[
 \theta_0<\theta_1<\theta_2<\theta_3<\theta_0+1.
@@ -99,29 +107,30 @@ theta0 ===== u=0 ===== theta1 ----- linear 0→1 ----- theta2
 theta2 ===== u=1 ===== theta3 ----- linear 1→0 ----- theta0+1
 ```
 
-设最小 gap 为 \(\delta\)，当前默认值是 `0.03`。四个循环 gaps 满足
+四个循环 gaps 是
 
 \[
 \begin{aligned}
 g_0&=\theta_1-\theta_0,\\
 g_1&=\theta_2-\theta_1,\\
 g_2&=\theta_3-\theta_2,\\
-g_3&=\theta_0+1-\theta_3,
+g_3&=\theta_0+1-\theta_3.
 \end{aligned}
-\qquad
-g_i\ge\delta,\qquad \sum_i g_i=1.
 \]
 
-取局部周期坐标
+其中 \(g_0\) 和 \(g_2\) 分别是 0 plateau 与 1 plateau 的宽度，\(g_1\) 与 \(g_3\)
+是上升段和下降段的宽度。
+
+令
 
 \[
 t=(\xi-\theta_0)\bmod 1,
 \]
 
-完整边界 profile 为
+边界 profile 为
 
 \[
-g_{\boldsymbol\theta}(t)=
+h_{\boldsymbol\theta}(t)=
 \begin{cases}
 0,
 &0\le t\le g_0,\\[3pt]
@@ -134,85 +143,59 @@ g_{\boldsymbol\theta}(t)=
 \end{cases}
 \]
 
-因此，在理想的连续设计 profile 上：
+因此：
 
-- \(\Gamma_0=[\theta_0,\theta_1]\) 是理想的 \(u=0\) plateau；
-- \(\Gamma_1=[\theta_2,\theta_3]\) 是理想的 \(u=1\) plateau；
-- 另外两段不是 free boundary，而是预先规定好的弧长线性 transition。
+- `min_curve` 是边界弧 \(\Gamma_0=[\theta_0,\theta_1]\)，理想 profile 上严格为 0；
+- `max_curve` 是边界弧 \(\Gamma_1=[\theta_2,\theta_3]\)，理想 profile 上严格为 1；
+- 内部的 \(u=q\), \(0<q<1\) 等值线由 harmonic solve 产生，不是另外四个设计变量。
 
-实现位于 [`cyclic_boundary_profile`](boundary_opt.py#L154)。
+profile 关于边界坐标是 \(C^0\) 分片线性的：值连续，四个 knots 处的斜率可以跳变。
+实现是 [`cyclic_boundary_profile`](boundary_opt/boundary.py)。
 
-这个 profile 关于边界坐标是 \(C^0\) 分片线性的：函数值连续，但在四个 knots 处斜率
-跳变，所以它不是 \(C^1\)，更不是 \(C^2\)。
+### 3.1 不插入虚拟顶点时，端点怎样保持连续？
 
-### 3.1 `min_curve` 和 `max_curve` 是不是优化出来的 curve？
-
-四个参数优化的是理想 profile 中 \(\Gamma_0\) 和 \(\Gamma_1\) 的连续端点，所以从
-设计语义上说，这两段 boundary arcs 是优化结果。但当前离散 mesh 只在原始顶点采样：
-离散的 exact plateau 由端点值都严格为 0 或 1 的完整 boundary edges 组成，通常不会
-精确终止在一个落于 edge 内部的 knot。只有 knot 与原始顶点对齐时，理想 curve 和
-离散 curve 才完全一致。
-
-内部的 \(u=c\), \(0<c<1\) isolines 是 harmonic solve 的结果，不是额外优化的显式
-折线。
-
-### 3.2 一个重要的离散细节
-
-四个 knots 是连续的 \([0,1)\) 坐标，但当前线性版本**不插入虚拟顶点**。代码只在
-原始 boundary vertices 的 \(\xi_j\) 上采样
+四个 knots 始终是 \([0,1)\) 上的浮点位置，不要求落在已有顶点上。实现只在原始边界
+顶点 \(\xi_j\) 处采样
 
 \[
-z_j=g_{\boldsymbol\theta}(\xi_j).
+z_j=h_{\boldsymbol\theta}(\xi_j),
 \]
 
-mesh 随后在每条原始边上做普通 P1 插值。因此，如果 knot 落在一条边的内部，显示出来
-的离散 trace 不会在 knot 处拥有一个精确 breakpoint；它只是由该边两端采样值决定的
-整边线性函数。knot 与原始顶点重合时则可以精确表达 breakpoint。
+然后 mesh 的 P1 basis 在每条原始边上插值这些 nodal values。这样无需修改拓扑、无需
+局部重三角化，矩阵结构也始终固定。
 
-这是“不增加顶点”的简洁代价，也是它和 continuous partial 版本局部 cut assembly 的
-关键区别。
+代价是：若 knot 位于一条原始边内部，该边上显示的离散 trace 由两个端点值线性插值得到，
+不会在 knot 处出现一个精确折点。理想弧端点仍然是连续优化量，但“严格等于 0 或 1 的
+离散曲线”只由两端采样值都等于目标值的完整 boundary edges 组成。网格细化后，这个采样
+误差会随边界边长减小。
 
 ---
 
-## 4. 这不是 partial Dirichlet / Neumann 问题
+## 4. 完整 Dirichlet 边界条件
 
-线性版本的理想连续模型可以写成
+理想模型是
 
 \[
 \begin{cases}
 \Delta u=0,&x\in\Omega,\\
-u=g_{\boldsymbol\theta},&x\in\partial\Omega.
+u=h_{\boldsymbol\theta},&x\in\partial\Omega.
 \end{cases}
 \]
 
-当前代码实际求解的是它的 boundary-vertex-sampled P1 离散版本：
+代码求解它的 boundary-vertex-sampled P1 离散版本：
 
 \[
-u_h(b_j)=g_{\boldsymbol\theta}(\xi_j),
+u_h(b_j)=h_{\boldsymbol\theta}(\xi_j),
 \qquad
-u_h|_{\partial\Omega}=I_hg_{\boldsymbol\theta},
+u_h|_{\partial\Omega}=I_hh_{\boldsymbol\theta},
 \]
 
-其中 \(I_h\) 表示由原始 boundary edge basis 做的 nodal interpolation。也就是说，
-理想 profile 的第二行作用于整条连续边界，而实现固定整圈 boundary nodal values；当
-knot 位于 edge 内部时，两者存在上一节说明的采样差异。
+其中 \(I_h\) 是原始 boundary edge basis 的 nodal interpolation。整圈边界顶点值都由
+profile 给定，state solve 只需要求内部顶点值。
 
-两段 plateau samples 和两段 transition samples 全部是已知 Dirichlet data，所以边界
-顶点不会参与 state solve，也不会自动产生 \(\partial_\nu u=0\) 的 natural Neumann
-condition。
-
-两种模型的最小区别可以写成：
-
-```text
-linear all-boundary:
-    全部 u_B = z(theta) 已知，只求 interior u_I
-
-partial Dirichlet:
-    只有 Gamma0/Gamma1 已知，其余 boundary values 和 interior 一起求
-```
-
-所以线性版本表现好，不能解释成“PDE 自动找到了线性 transition”。这里的 transition
-本来就是模型输入的一部分。
+这正是图形学中常见的 harmonic interpolation：指定一组边界 nodal values，其余顶点由
+最小 Dirichlet energy 自动补全。这里的特别之处仅在于边界 nodal values 不是手工逐个
+指定，而是由四个连续 endpoints 生成。
 
 ---
 
@@ -221,16 +204,16 @@ partial Dirichlet:
 Harmonic field 是 Dirichlet energy 的最小化器：
 
 \[
-\mathcal E(u)=\frac12\int_\Omega \lVert\nabla u\rVert^2\,dA.
+\mathcal E(u)=\frac12\int_\Omega\lVert\nabla u\rVert^2\,dA.
 \]
 
-使用三角形 P1 finite elements 离散后，能量写成
+在三角形 P1 finite elements 中，
 
 \[
 \mathcal E(\boldsymbol u)=\frac12\boldsymbol u^TK\boldsymbol u,
 \]
 
-其中 \(K\) 是 cotangent stiffness matrix。把顶点重排成内部集合 \(I\) 和边界集合
+其中 \(K\) 是 cotangent stiffness matrix。将顶点重排成内部集合 \(I\) 和边界集合
 \(B\)：
 
 \[
@@ -247,14 +230,7 @@ K_{BI}&K_{BB}
 \end{bmatrix}.
 \]
 
-因为 \(\boldsymbol z\) 已知，只对 \(\boldsymbol u_I\) 求极小值：
-
-\[
-\frac{\partial\mathcal E}{\partial\boldsymbol u_I}
-=K_{II}\boldsymbol u_I+K_{IB}\boldsymbol z=0.
-\]
-
-于是
+因为 \(\boldsymbol z\) 已知，只对 \(\boldsymbol u_I\) 极小化：
 
 \[
 K_{II}\boldsymbol u_I=-K_{IB}\boldsymbol z,
@@ -262,20 +238,20 @@ K_{II}\boldsymbol u_I=-K_{IB}\boldsymbol z,
 \boldsymbol u_I=-K_{II}^{-1}K_{IB}\boldsymbol z.
 \]
 
-这就是“给定任意 boundary condition，内部自动求出来”的离散版本。
+初始化时，代码组装一次 \(K\) 并对固定的 \(K_{II}\) 做一次稀疏 LU 分解。之后每次
+objective evaluation 只更新右端项并回代，不会重新 factorize。
 
-对应实现：
+相关实现：
 
-- [`cotangent_stiffness`](boundary_opt.py#L246)：组装 \(K\)；
-- [`HarmonicBoundaryOptimizer.__init__`](boundary_opt.py#L303)：提取固定 block 并分解
-  \(K_{II}\)；
-- [`extend`](boundary_opt.py#L360)：执行一次 harmonic extension。
+- [`boundary_opt/mesh.py`](boundary_opt/mesh.py) 中的 `cotangent_stiffness` 与
+  `face_gradient_basis`；
+- [`boundary_opt/harmonic.py`](boundary_opt/harmonic.py) 中的 `HarmonicField.solve`。
 
 ---
 
-## 6. `u = Ez` 到底是什么意思？
+## 6. `u = Ez` 是数学简写，不是另一种算法
 
-将边界到全场的线性映射记成
+定义边界到全场的线性 operator
 
 \[
 E=
@@ -285,61 +261,38 @@ I_B
 \end{bmatrix},
 \]
 
-就得到
+就有
 
 \[
 \boldsymbol u=E\boldsymbol z.
 \]
 
-这不是另一种近似，也没有改变结果；它只是把“解一次 Dirichlet problem”写成一个线性
-operator。数学上显式形成 \(E\) 很漂亮，但 \(E\) 通常是大而稠密的，代码没有必要
-真的保存它。
+显式形成 \(E\) 通常会得到一个大而稠密的矩阵，所以代码不保存它。`extend` 通过稀疏
+回代隐式完成同一个线性映射，数值模型没有任何差别。
 
-当前实现采用更省内存的隐式形式：
-
-1. 初始化时稀疏 LU 分解 \(K_{II}\) 一次；
-2. 每次参数变化，只重新生成很小的 boundary vector \(\boldsymbol z\)；
-3. 计算右端项 \(-K_{IB}\boldsymbol z\)；
-4. 用同一份 LU factors 回代得到 \(\boldsymbol u_I\)。
-
-因此 `u=Ez` 与当前代码的数值结果没有差距。它是对现有 solve 的数学概括，而不是建议
-额外构造一个 dense matrix。
-
-### 6.1 可选的 Schur complement 视角
-
-把内部解代回能量可得纯边界能量
+如果只关心边界能量，还可以写出 Schur complement
 
 \[
-\mathcal E_D(\boldsymbol z)=\frac12\boldsymbol z^TS\boldsymbol z,
+S=K_{BB}-K_{BI}K_{II}^{-1}K_{IB},
+\qquad
+\mathcal E_D(\boldsymbol z)=\frac12\boldsymbol z^TS\boldsymbol z.
 \]
 
-其中
-
-\[
-S=K_{BB}-K_{BI}K_{II}^{-1}K_{IB}.
-\]
-
-\(S\) 可以理解为离散 Dirichlet-to-Neumann / Steklov operator。不过当前 outer loss
-需要每个三角形上的 \(\nabla u\)，所以最终仍要得到内部场；实现不需要显式形成 \(S\)。
+不过当前 loss 需要每个 face 的 \(\nabla u\)，最终仍要恢复内部场，因此没有必要显式
+构造 \(S\)。
 
 ---
 
-## 7. Loss 在测量什么？
+## 7. Loss 究竟测量什么？
 
-对每个三角形 \(f\)，P1 field 的梯度在该三角形内是常量：
-
-\[
-\boldsymbol g_f=\nabla u|_f,
-\qquad
-r_f=\lVert\boldsymbol g_f\rVert^2.
-\]
-
-用面积归一化权重
+P1 field 在每个三角形 \(f\) 内有常梯度。记
 
 \[
-w_f=\frac{A_f}{\sum_jA_j},
+\boldsymbol q_f=\nabla u|_f,
 \qquad
-\sum_fw_f=1,
+r_f=\lVert\boldsymbol q_f\rVert^2,
+\qquad
+w_f=\frac{A_f}{\sum_jA_j}.
 \]
 
 定义
@@ -350,7 +303,7 @@ w_f=\frac{A_f}{\sum_jA_j},
 m_2=\sum_fw_fr_f^2.
 \]
 
-当 \(\mu>0\) 时，当前 uniformity loss 是
+当 \(\mu>0\) 时，uniformity loss 是
 
 \[
 L_{\mathrm{uniform}}
@@ -359,58 +312,54 @@ L_{\mathrm{uniform}}
 =\operatorname{CV}_w^2(r).
 \]
 
-它有三个直接性质：
+它有三个关键性质：
 
-1. \(L\ge0\)；
-2. 当所有三角形的非零 \(\lVert\nabla u\rVert\) 相同时，\(L=0\)；
-3. 把整个场乘以非零常数不会改变 loss，加上常数偏移也不会改变 loss。
+1. \(L_{\mathrm{uniform}}\ge0\)；
+2. 所有 face 的非零 \(\lVert\nabla u\rVert\) 相同时，loss 等于 0；
+3. 对 \(u\mapsto au+b\), \(a\ne0\)，loss 不变。
 
-若整个场的梯度全部为零，则 \(\mu=0\)，CV 是未定义的 `0/0`；当前实现会明确拒绝
-这个状态，而不是把它记作零 loss。
+代码额外报告 `spacing_cv`，它是
+\(\operatorname{CV}_w(\lVert\nabla u\rVert)\)，并不等于当前 loss 的平方根。实现位于
+[`uniformity_loss_and_gradient`](boundary_opt/loss.py)。
 
-实现位于 [`_loss_and_field_gradient`](boundary_opt.py#L387)。
+### 7.1 为什么这与 isoline spacing 有关？
 
-程序另外报告的 `spacing_cv` 是
-\(\operatorname{CV}_w(\lVert\nabla u\rVert)\)，而优化的 loss 是
-\(\operatorname{CV}_w^2(\lVert\nabla u\rVert^2)\)。二者在完全均匀时都为 0，但数值上
-不满足 `spacing_cv² == loss`；后者对大梯度 face 更敏感。
-
-### 7.1 为什么梯度均匀和 isoline 间距有关？
-
-沿 isoline 法向移动一个很小距离 \(d\ell\) 时，场值变化近似为
+沿等值线法向移动一个小距离 \(d\ell\) 时，
 
 \[
 du\approx\lVert\nabla u\rVert\,d\ell.
 \]
 
-所以相邻等值 \(c\) 和 \(c+\Delta c\) 的局部距离近似为
+相邻等值 \(q\) 与 \(q+\Delta q\) 的局部间距近似为
 
 \[
-\Delta\ell\approx\frac{\Delta c}{\lVert\nabla u\rVert}.
+\Delta\ell\approx\frac{\Delta q}{\lVert\nabla u\rVert}.
 \]
 
-固定 \(\Delta c\) 后，\(\lVert\nabla u\rVert\) 越均匀，局部 isoline spacing 越均匀。
+因此梯度模长越均匀，固定 value increment 的局部 isoline spacing 越均匀。但这仍是
+proxy：它不直接测整条等值线之间的 geodesic distance，也不评价等值线形状和拓扑。
 
-但它仍然只是 proxy：loss 不直接测量整条等值线之间的真实 geodesic distance，也不评价
-等值线是否笔直、是否具有期望拓扑。
+### 7.2 Loss 自身不保证“从 0 到 1”
 
-### 7.2 这个 loss 本身仍然不保证幅度为 0 到 1
+由于 scale invariance，几乎常值但相对均匀的场也可能得到很低的 CV loss。当前模型的
+0 与 1 来自完整边界 profile，而不是 uniformity loss。
 
-这是一个重要的数学事实：CV loss 对整体 scale 不敏感，一个几乎常数但梯度相对均匀的
-场也可能得到低 loss。
+如果 0 plateau 和 1 plateau 内各有至少一个边界采样顶点，那么离散 Dirichlet data
+确实包含 0 和 1。对很粗的边界，`minimum_gap` 只限制归一化弧长，并不自动保证 plateau
+中存在顶点，因此应同时检查：
 
-线性版本之所以通常能得到 \(0\to1\)，不是因为 loss，而是因为**完整 Dirichlet trace
-已经把 plateau 规定成 0 和 1**。在当前细分足够密的 Disk 和 Plane 上，plateau 内都有
-边界顶点，因此离散边界确实取得 0 和 1。
+- `field.min()` 与 `field.max()`；
+- 两个 plateau 上的完整 boundary edge 数量；
+- mesh refinement 后结果是否稳定。
 
-对于非常粗糙的边界，`minimum_gap` 并不自动证明每个 plateau 内一定存在采样顶点；应当
-额外检查 `field.min()`、`field.max()` 和 plateau vertex count。
+若整个离散场是常量，则 \(\mu=0\)，CV 是未定义的 \(0/0\)。公开的 loss 计算会抛出
+`DegenerateFieldError`，不会把这个状态误报成零 loss。
 
 ---
 
-## 8. 可选的 plateau width prior
+## 8. 可选的 plateau-width prior
 
-默认目标只有 uniformity loss。若希望 0/1 plateau 接近指定归一化宽度 \(a\)，可以加
+默认目标只有 uniformity loss。若希望两个 plateau 接近指定归一化宽度 \(a\)，可以加入
 
 \[
 L_{\mathrm{width}}
@@ -426,20 +375,17 @@ L_{\mathrm{width}}
 L=L_{\mathrm{uniform}}+L_{\mathrm{width}}.
 \]
 
-对应命令行参数是：
+构造函数参数是 `target_arc_width=a` 和 `width_weight=omega`。默认
+`width_weight=0`，即不使用 prior。开启它会改变数学问题，所以带 prior 和不带 prior
+的结果不能当成同一个 benchmark 比较。
 
-- `--target-arc-width a`；
-- `--width-weight omega`。
-
-默认 `width_weight=0`，即不使用该 prior。开启 prior 会改变原本的数学最优问题，因此
-不应把有 prior 和无 prior 的 loss 当成同一个 benchmark。实现位于
-[`_width_loss_and_gradient`](boundary_opt.py#L425)。
+实现是 [`width_loss_and_gradient`](boundary_opt/loss.py)。
 
 ---
 
-## 9. 为什么不需要 finite difference 或 autodiff？
+## 9. Exact adjoint gradient
 
-整个前向链条是
+整个前向链是
 
 \[
 \boldsymbol p
@@ -449,9 +395,15 @@ L=L_{\mathrm{uniform}}+L_{\mathrm{width}}.
 \longrightarrow L.
 \]
 
-先补齐从 face loss 到 vertex sensitivity 的一步。记
-\(\boldsymbol g_f=\nabla u|_f\) 和
-\(r_f=\boldsymbol g_f^T\boldsymbol g_f\)，则
+### 9.1 从 face loss 到 vertex sensitivity
+
+由
+
+\[
+L=\frac{m_2}{\mu^2}-1
+\]
+
+可得
 
 \[
 \frac{\partial L}{\partial r_f}
@@ -459,61 +411,56 @@ L=L_{\mathrm{uniform}}+L_{\mathrm{width}}.
 \left(r_f-\frac{m_2}{\mu}\right),
 \]
 
-因此
+进而
 
 \[
-\frac{\partial L}{\partial\boldsymbol g_f}
+\frac{\partial L}{\partial\boldsymbol q_f}
 =\frac{4w_f}{\mu^2}
-\left(r_f-\frac{m_2}{\mu}\right)\boldsymbol g_f.
+\left(r_f-\frac{m_2}{\mu}\right)\boldsymbol q_f.
 \]
 
-对三角形三个 P1 basis gradients 做 transpose scatter，就得到全局 vertex
-sensitivity
+对三个 P1 basis gradients 做 transpose scatter，得到
 
 \[
-\boldsymbol q=\frac{\partial L}{\partial\boldsymbol u}
+\boldsymbol s=\frac{\partial L}{\partial\boldsymbol u}
 =
 \begin{bmatrix}
-\boldsymbol q_I\\
-\boldsymbol q_B
+\boldsymbol s_I\\
+\boldsymbol s_B
 \end{bmatrix}.
 \]
 
-边界变化 \(d\boldsymbol z\) 引起
+### 9.2 用一次 transpose solve 传回边界
+
+边界扰动 \(d\boldsymbol z\) 引起
 
 \[
 d\boldsymbol u_I=-K_{II}^{-1}K_{IB}\,d\boldsymbol z.
 \]
 
-所以
+因此
 
 \[
-\begin{aligned}
-dL
-&=\boldsymbol q_I^Td\boldsymbol u_I
-  +\boldsymbol q_B^Td\boldsymbol z\\
-&=\left(
-\boldsymbol q_B-K_{IB}^TK_{II}^{-T}\boldsymbol q_I
+dL=
+\left(
+\boldsymbol s_B-K_{IB}^TK_{II}^{-T}\boldsymbol s_I
 \right)^Td\boldsymbol z.
-\end{aligned}
 \]
 
-这就是我们需要的 \(E^T\boldsymbol q\)，但没必要构造 \(E\)。先解一次 transpose
-system：
+先解
 
 \[
-K_{II}^T\boldsymbol\lambda=\boldsymbol q_I.
+K_{II}^T\boldsymbol\lambda=\boldsymbol s_I,
 \]
 
-然后
+再得到
 
 \[
 \frac{\partial L}{\partial\boldsymbol z}
-=E^T\boldsymbol q
-=\boldsymbol q_B-K_{IB}^T\boldsymbol\lambda.
+=\boldsymbol s_B-K_{IB}^T\boldsymbol\lambda.
 \]
 
-最后使用 chain rule：
+最后用 chain rule：
 
 \[
 \nabla_{\boldsymbol p}L
@@ -524,437 +471,571 @@ K_{II}^T\boldsymbol\lambda=\boldsymbol q_I.
 +\nabla_{\boldsymbol p}L_{\mathrm{width}}.
 \]
 
-这就是 [`extend_adjoint`](boundary_opt.py#L373) 和
-[`loss_and_gradient`](boundary_opt.py#L446) 做的事情。
+每次 objective + gradient 的主要成本是一遍 forward backsolve 和一遍 transpose
+backsolve；两者复用同一份 LU factorization。`solve_adjoint` 位于
+[`boundary_opt/harmonic.py`](boundary_opt/harmonic.py)，高层 chain rule 位于
+[`boundary_opt/optimizer.py`](boundary_opt/optimizer.py)。
 
-一次完整 objective + exact gradient 的主要成本是：
-
-- 一次 forward triangular backsolve；
-- 一次 transpose adjoint backsolve；
-- 两者都复用初始化时的同一份 LU factorization。
-
-因此在只有四个 outer parameters 时，引入 JAX 并不会让数学更短；当前手写 adjoint 已经把
-最关键的线性结构表达得很直接。
+这套手写 adjoint 直接利用了固定线性系统，比对四个变量做 finite difference 更准确，
+也不需要为了这个小型外层问题引入 autodiff runtime。
 
 ---
 
-## 10. 如何始终保证四个 endpoints 有序？
+## 10. 中心相位 + 四个完整 gaps
 
-优化器直接使用有物理意义的四维坐标
+优化状态是
 
 \[
-\boldsymbol p=(o,g_0,g_1,g_2),
+\boldsymbol p=(c,g_0,g_1,g_2,g_3),
 \qquad
-g_3=1-g_0-g_1-g_2.
-\]
-
-可行域是闭合 simplex：
-
-\[
-g_0,g_1,g_2\ge\delta,
+g_i\ge\delta,
 \qquad
-g_0+g_1+g_2\le1-\delta.
+\sum_i g_i=1.
 \]
 
-最后一个不等式恰好等价于 \(g_3\ge\delta\)。knots 是固定的仿射映射：
+其中 \(c\) 是四个 unwrapped knots 的平均值：
 
 \[
-\boldsymbol\theta=
-\left(o,\ o+g_0,\ o+g_0+g_1,\ o+g_0+g_1+g_2\right).
+c=\frac14\sum_{i=0}^3\theta_i\pmod 1.
 \]
 
-因此 knot Jacobian 不再依赖参数：
+在可行 simplex 上，从状态到 knots 的映射为
 
 \[
-\frac{\partial\boldsymbol\theta}{\partial\boldsymbol p}
-=
-\begin{bmatrix}
-1&0&0&0\\
-1&1&0&0\\
-1&1&1&0\\
-1&1&1&1
-\end{bmatrix}.
+\begin{aligned}
+\theta_0&=c-\tfrac34g_0-\tfrac12g_1-\tfrac14g_2,\\
+\theta_1&=c+\tfrac14g_0-\tfrac12g_1-\tfrac14g_2,\\
+\theta_2&=c+\tfrac14g_0+\tfrac12g_1-\tfrac14g_2,\\
+\theta_3&=c+\tfrac14g_0+\tfrac12g_1+\tfrac34g_2.
+\end{aligned}
 \]
 
-offset 在 SLSQP 中保持为无约束实数，因为目标满足
+立刻可以验证：
 
 \[
-L(o+1,g)=L(o,g).
+\theta_1-\theta_0=g_0,
+\quad
+\theta_2-\theta_1=g_1,
+\quad
+\theta_3-\theta_2=g_2,
 \]
 
-只在初值 canonicalization 以及输出和显示时取模到 \([0,1)\)，避免在 \(0/1\) seam
-上制造假的 box constraint。
+而等式约束给出
 
-与旧 softmax 参数化不同，这个可行集是闭的，能够真正达到 \(g_i=\delta\) 的 active
-constraint，不存在 logit saturation。SLSQP 直接处理三个 lower bounds 和一个线性
-sum constraint。若 line search 临时试探到 \(g_3\le0\) 的 profile 定义域外，内部
-objective 返回有限二次惩罚，把试探方向推回可行域；这不会改变可行 simplex 内的 loss
-或 exact gradient。另一个离散退化情形是：在很粗的 boundary mesh 上，0/1 plateau
-可能恰好都落在顶点之间，使所有 boundary samples 相同，此时 CV loss 是 \(0/0\)。代码只在
-这个原目标未定义的状态使用一个指向 uniform-gap reference 的有限二次 recovery penalty；
-只要 harmonic field 非常量，计算的仍是原始 loss 和解析梯度。
+\[
+\theta_0+1-\theta_3
+=1-g_0-g_1-g_2
+=g_3.
+\]
 
-由于把 \(g_3\) 消去会轻微偏爱一个坐标图，代码从原始场及其互补场
-\(u\leftrightarrow1-u\) 各跑一次局部 SLSQP。每个 chart 的所有非退化 feasible objective
-evaluations——包括 line-search trials——都可以更新 incumbent，再比较两个 chart。若候选
-相对原始初值没有超过数值容差的实质改进，就返回 canonicalized 原始初值。两者的 loss
-和 width prior 完全等价；选中互补分支时，结果会映回原始 0/1 labeling。这不是 Plane
-专用候选。
+公式中没有出现单独的 \(g_3\) 列，不代表 \(g_3\) 被特殊对待：它作为完整状态和完整
+约束的一部分参与每一次投影或约束求解；在四维可行超平面上改变 \(g_3\)，必须同时改变
+至少一个其他 gap，knots 因而随之变化。
 
-为了让原始初值和互补初值在浮点数层面产生完全相同的一对 local starts，代码仅在构造
-start 时保留 14 位小数，并投影回闭合 simplex。这是确定性的数值 canonicalization，
-不是把连续参数离散化；SLSQP 后续仍在连续变量上优化。
+这种坐标有三个好处：
 
-实现位于 [`knots_from_parameters`](boundary_opt.py#L194)。
+1. 四个 gaps 全部显式存在，约束和投影对它们一视同仁；
+2. \(c\) 是几何中心相位，不把任何一个 endpoint 选成特殊 origin；
+3. 可行域是闭集，可以精确达到 \(g_i=\delta\) 的 active constraint。
+
+相位保持为无约束实数，因为
+
+\[
+L(c+1,\boldsymbol g)=L(c,\boldsymbol g).
+\]
+
+只有公开输出与显示时才把相位或 knots canonicalize 到一个周期内，避免在 seam 上产生
+假的 box boundary。
+
+### 10.1 Euclidean simplex projection
+
+SPG 以及公共工具函数使用
+
+\[
+\Pi_{\Delta_\delta}(\boldsymbol g)
+=\arg\min_{\boldsymbol y}
+\frac12\lVert\boldsymbol y-\boldsymbol g\rVert^2
+\quad\text{s.t.}\quad
+y_i\ge\delta,
+\ \sum_i y_i=1.
+\]
+
+`project_gaps` 用标准 threshold 算法精确计算这个投影；`project_parameters` 只投影 gap
+block，中心相位不变。实现位于 [`boundary_opt/simplex.py`](boundary_opt/simplex.py)。
+
+### 10.2 SLSQP 试探点的对称延拓
+
+SLSQP 会在等式约束附近评估 trial points。为使状态到 knots 的映射在这些点也有定义，
+代码先把 trial gaps \(\widetilde{\boldsymbol g}\) 对称归一化到 simplex。令
+
+\[
+C=1-4\delta,
+\qquad
+a_i=\widetilde g_i-\delta,
+\]
+
+则在 bounds 内
+
+\[
+\widehat g_i
+=\delta+C\frac{a_i}{\sum_j a_j}.
+\]
+
+当 \(\sum_i\widetilde g_i=1\) 时，\(\widehat{\boldsymbol g}=\widetilde{\boldsymbol g}\)；
+离开等式超平面时，它为四个 gaps 提供完全对称的延拓。`knots_from_parameters` 同时返回
+这个归一化的精确 Jacobian，因此传给 SLSQP 的仍是其实际 objective 的解析梯度。
 
 ---
 
-## 11. SLSQP 实际优化了什么？
+## 11. 高层 optimizer 做了什么？
 
-[`optimize`](boundary_opt.py#L462) 的每一步是：
+公共入口是：
 
-1. 从四维参数得到 ordered knots 和 gaps；
+```python
+from boundary_opt import BoundaryOptimizer, load_obj, random_knots
+
+mesh = load_obj("data/disk.obj")
+optimizer = BoundaryOptimizer(mesh, minimum_gap=0.03)
+initial_knots = random_knots(seed=0, minimum_gap=0.03)
+
+result = optimizer.optimize(
+    initial_knots,
+    backend="slsqp",
+    max_iterations=100,
+    seed=0,
+)
+```
+
+将 `backend` 改为 `"spg"` 即可在完全相同的物理初值上切换算法。也可以一次运行两个：
+
+```python
+results = optimizer.optimize_backends(initial_knots, max_iterations=100, seed=0)
+```
+
+每次 loss evaluation 的物理部分完全相同：
+
+1. 参数映射到 ordered knots 与 physical gaps；
 2. 在原始 boundary vertices 上生成完整 trace；
-3. 用预分解的 \(K_{II}\) 求 harmonic field；
-4. 计算所有 face gradients 和 loss；
-5. 用 adjoint 得到四维解析 gradient；
-6. SLSQP 产生下一个局部迭代状态；只有满足数值可行容差的状态进入公开 `history`。
+3. 通过预分解的 \(K_{II}\) 求 harmonic field；
+4. 计算 face gradients、loss 与 field sensitivity；
+5. 用 adjoint 和 chain rule 得到参数梯度。
 
-这里没有：
+两个 backend 使用同一种 objective 接口。高层只 cache 重复 evaluation；backend 负责保存
+它接受的可行 iterates。离散常量场会使原始 CV loss 未定义，此时直接抛出
+`DegenerateFieldError`。如果 backend 没有收敛，`optimize` 直接抛出 `RuntimeError`，不会换用
+恢复起点、惩罚 surrogate 或中途出现过的最低 loss。
 
-- 对所有 mesh vertex 做高维非线性优化；
-- 每次从头做稀疏 factorization；
-- finite-difference gradient；
-- moving vertex set；
-- contour extraction 参与 loss。
+返回的 `OptimizationResult` 包含：
 
-`history` 首先记录原始物理初值，随后保留所选坐标图中 feasible SLSQP states 的原始顺序，
-不会把整条曲线改写成单调的 best-so-far。SLSQP 的 merit-function 步骤不保证 objective
-严格单调。最终返回两次 local solves 中所有有效 objective evaluations 里最低-loss 的可行
-incumbent；若它不是公开记录的最后一点，就把它在 `history` 末尾再记录一次，使
-`history[-1] == final_loss`，动画也确实结束在返回场。它可能来自较早状态或 line-search
-trial，因此最后一点不一定是新的 SLSQP iteration。
-`evaluations` 是所选局部 solve 的 objective 调用数，`total_evaluations` 则包含两个互补坐标图。
+- `knots`、`gaps`、`field` 和最终 loss 分解；
+- `history` 与对应的 `parameter_history`；
+- backend 名称、迭代数和 evaluation 数；
+- `kkt_residual` 与 `constraint_violation`。
 
-若初值本身就是离散常量场，原始 CV loss 是未定义的；此时 `initial_loss` 和 `history[0]`
-明确记录 recovery surrogate，而不是冒充一个真实 CV 数值。后续非退化记录仍可用公开
-`loss_and_gradient` 逐点重放。
+只有 backend 成功收敛才会产生 `OptimizationResult`。
 
-active constraint 上 raw gradient 可以不为零，因此代码另外报告 projected KKT residual：
+---
+
+## 12. SLSQP backend
+
+SLSQP 直接求解
 
 \[
-r_{\mathrm{KKT}}
-=\left\|g-\Pi_{\Delta_\delta}\left(g-\nabla_gL\right)\right\|,
+\min_{c,\boldsymbol g}L(c,\boldsymbol g)
+\quad\text{s.t.}\quad
+g_i\ge\delta,
+\quad
+\boldsymbol 1^T\boldsymbol g=1.
 \]
 
-并与 offset gradient 一起合成四维残差。判断约束收敛应看这个量，而不是只看
-`gradient_norm`。
+实现 [`boundary_opt/slsqp_backend.py`](boundary_opt/slsqp_backend.py) 将约束交给 SciPy：
+
+- center 的 bounds 为 \(({-}\infty,+\infty)\)；
+- 四个 gaps 各有 lower bound \(\delta\)；
+- 一个 `LinearConstraint` 精确表达 \(\sum_i g_i=1\)；
+- objective 同时返回 loss 和 exact gradient；
+- callback 只记录可行的 iterates。
+
+SLSQP 每一步建立局部 quadratic subproblem，并用 merit-function line search 协调目标与
+约束。它的 history 不保证 loss 严格单调；这不是 bug，而是约束优化 line search 的正常
+行为。
+
+当前默认 backend 是 `"slsqp"`。它适合这个低维、带简单线性约束、已有精确梯度的问题。
+不过 SLSQP 的 `success=True` 只说明它满足自己的局部终止条件，不构成全局最优证明。
 
 ---
 
-## 12. 用 Disk 完整看一次结果
+## 13. SPG backend：BB1 + nonmonotone Armijo
 
-当前 `data/disk.obj` 有：
+SPG 是 spectral projected gradient。它只需要 objective gradient 和 simplex projection，
+不建立 quadratic subproblem。
 
-- 4317 个顶点；
-- 8423 个三角形；
-- 209 个边界顶点。
+### 13.1 Projected direction
 
-默认无 width prior、`minimum_gap=0.03`、seed 0、100 iterations 的保存结果为：
+给定当前状态 \(\boldsymbol p_k\)、gradient \(\nabla L_k\) 和 spectral scale
+\(\alpha_k\)，先算
 
-| 指标 | 数值 |
-|---|---:|
-| initial loss | `12.767339` |
-| final loss | `0.0283656` |
-| selected SLSQP iterations | `26` |
-| selected / total objective evaluations | `63 / 114` |
-| optimized gaps | `(0.15033, 0.34617, 0.15169, 0.35181)` |
-| reported `spacing_cv` of \(\lVert\nabla u\rVert\) | `0.07753` |
+\[
+\boldsymbol d_k
+=\Pi\!\left(\boldsymbol p_k-\alpha_k\nabla L_k\right)
+-\boldsymbol p_k,
+\]
 
-最终两条 hard plateaus 宽度接近，两条 transition 宽度也接近。这与 Disk 的近似旋转
-对称性一致，但不是代码硬编码的对称约束。
+其中 \(\Pi\) 只投影 gap block。若未达到约束驻点，通常有
 
-![线性全边界版本在 Disk 上的最终场](docs/figures/linear-disk-final-polyscope.png)
+\[
+\nabla L_k^T\boldsymbol d_k<0.
+\]
 
-16 个随机 seeds 的结果为：
+trial state 使用
 
-| 统计量 | final loss |
-|---|---:|
-| best | `0.0277592` |
-| median | `0.0283690` |
-| worst | `0.0291800` |
+\[
+\boldsymbol p_k(t)=\Pi(\boldsymbol p_k+t\boldsymbol d_k),
+\]
 
-16/16 次 SciPy 都报告成功，且没有 plateau gap 触碰 `minimum_gap`。这些结果说明当前
-mesh 上存在稳定的低-loss basins，但不能证明其中任何一个是全局最优。
+所以每个被接受状态都保持可行。
 
-下图中细线是每个 seed，粗线是各记录位置的 pointwise median；较短序列在计算 median 时
-用自身末值延续，纵轴为 log scale。若最终 incumbent 来自更早状态，最后一个记录会明确
-回到该返回值，而不是伪造一条单调曲线。
+### 13.2 Nonmonotone Armijo line search
 
-![Disk 与 Plane 的 16-seed loss curves](docs/figures/linear-disk-plane-loss-curves.svg)
+普通 monotone line search 要求每一步都低于上一点，可能对弯曲狭长的 basin 过于保守。
+当前实现使用最近十个 accepted losses 的最大值作为 reference：
+
+\[
+L_{\mathrm{ref}}
+=\max\{L_{k-j}:0\le j<10\}.
+\]
+
+接受条件是
+
+\[
+L(\boldsymbol p_k(t))
+\le
+L_{\mathrm{ref}}
++10^{-4}t\,\nabla L_k^T\boldsymbol d_k.
+\]
+
+若不满足，就令 \(t\leftarrow t/2\) 并重试。因为 reference 不是只取当前 loss，单步可以
+小幅上升，但最近窗口的上界受到控制；这种非单调性常能减少狭窄区域中的无谓回溯。
+
+### 13.3 BB1 spectral step
+
+接受新点后，令
+
+\[
+\boldsymbol s_k=\boldsymbol p_{k+1}-\boldsymbol p_k,
+\qquad
+\boldsymbol y_k=\nabla L_{k+1}-\nabla L_k.
+\]
+
+若 \(\boldsymbol s_k^T\boldsymbol y_k>0\)，BB1 scale 是
+
+\[
+\alpha_{k+1}
+=\frac{\boldsymbol s_k^T\boldsymbol s_k}
+{\boldsymbol s_k^T\boldsymbol y_k},
+\]
+
+再截断到实现允许的稳定区间。它用一个标量近似 inverse curvature，通常比固定 learning
+rate 更适合不同 mesh 和不同局部尺度。曲率信息不可靠时，代码退回安全的最大 scale。
+
+### 13.4 终止条件
+
+SPG 使用 unit-step projected-gradient mapping：
+
+\[
+r_{\mathrm{PG}}
+=\left\|
+\boldsymbol p-\Pi(\boldsymbol p-\nabla L)
+\right\|_\infty.
+\]
+
+它同时检测 center gradient 和 gap simplex 的约束驻点条件。active constraint 上 raw
+gradient 不必为零，因此这个量比普通 gradient norm 更有解释力。实现位于
+[`boundary_opt/spg_backend.py`](boundary_opt/spg_backend.py)。
 
 ---
 
-## 13. 为什么 Plane 四角是可证明的全局最优？
+## 14. 两个 backend 怎样选择？
 
-下面的证明针对默认 `width_weight=0`，并要求矩形四条边的归一化长度都大于
-`minimum_gap`；当前 `data/plane.obj` 与 \(\delta=0.03\) 满足这些条件。若开启不匹配
-四角 plateau width 的 width prior，四角场仍有零 uniformity loss，但总 loss 不再为零。
+两个 backend 优化同一个目标、使用同一套参数、相同 adjoint gradient 和相同高层结果
+筛选。区别只在 outer step 如何产生。
+
+| 方面 | SLSQP | SPG |
+|---|---|---|
+| 约束处理 | bounds + 线性等式 | 每一步 Euclidean projection |
+| 局部尺度 | quadratic subproblem | BB1 scalar spectral scale |
+| line search | SciPy merit-function | 最近窗口的 Armijo reference |
+| accepted states | 可能经约束恢复后接受 | 天然保持在 simplex 上 |
+| 特点 | 低维约束问题中通常很高效 | 结构透明、实现小、容易检查 |
+| 保证 | 局部终止 | 局部 projected stationarity |
+
+建议把 SLSQP 作为默认结果，把 SPG 作为独立实现和交叉检查。如果两者从同一初值收敛到
+相近的 physical knots、loss 和小 projected-gradient residual，可信度会更高；若结果
+不同，说明它们可能进入了不同 basin，需要增加随机种子或检查 active constraints。
+
+二者都是局部优化器，都不能仅凭一次运行证明找到了 global minimum。
+
+---
+
+## 15. 用 Disk 理解优化结果
+
+Disk 的边界接近旋转对称。若离散网格也足够均匀，一个自然的低-loss 结构通常具有：
+
+- 0 plateau 与 1 plateau 宽度接近；
+- 上升段与下降段宽度接近；
+- 两组弧大致相隔半圈；
+- 内部 isolines 近似平行、间距比较均匀。
+
+这些只是几何对称性对最优解的提示，不是代码写入的 symmetry constraint。三角剖分、边界
+采样、初值和局部 basin 都可能造成轻微不对称。
+
+![Disk 上的一次优化后 harmonic field](docs/figures/linear-disk-final-polyscope.png)
+
+读图时要分清两件事：边界上标出的 0/1 arcs 是优化出来的两个 plateaus；mesh 内部彩色
+等值线是对应边界 trace 的 harmonic extension。它们共同由最终四个 knots 决定，但内部
+等值线不是显式设计曲线。
+
+不要把某次保存图片中的数值当成固定 benchmark。更可靠的做法是用同一 mesh、同一参数
+分别扫描两个 backend，比较 loss 分布、constraint violation、projected-gradient residual
+和最终 gaps。复现命令见第 18 节。
+
+---
+
+## 16. 为什么 Plane 四角是可证明的全局最优？
+
+下面的证明要求：
+
+- `width_weight=0`；
+- mesh 的外边界是矩形，四个角是边界顶点；
+- 每条边的归一化长度都不小于 `minimum_gap`。
 
 考虑矩形
-\(\Omega=[x_{\min},x_{\min}+W]\times[y_{\min},y_{\min}+H]\)。把左边界规定为
-\(u=0\)，右边界规定为 \(u=1\)，上下边界按 \(x\) 线性变化。解析函数
+
+\[
+\Omega=[x_{\min},x_{\min}+W]\times[y_{\min},y_{\min}+H].
+\]
+
+令 0 plateau 位于左边，1 plateau 位于右边；一条水平边从 0 线性上升到 1，另一条水平边
+从 1 线性下降到 0。也就是把四个 knots 放在四个角上，并选择匹配这个方向的循环标号。
+
+解析函数
 
 \[
 u(x,y)=\frac{x-x_{\min}}{W}
 \]
 
-同时满足：
+满足
 
 \[
 \Delta u=0,
 \qquad
-u|_{\partial\Omega}=g_{\boldsymbol\theta},
+u|_{\partial\Omega}=h_{\boldsymbol\theta},
 \qquad
 \lVert\nabla u\rVert=\frac1W.
 \]
 
-当四个 knots 位于矩形四角时，线性 boundary profile 正好等于这个 affine field 的完整
-边界 trace。P1 finite elements 能精确再现 affine function，因此每个三角形上的梯度
-相同：
+P1 finite elements 可以精确表示 affine function。因此不论矩形内部如何进行合法三角剖分，
+只要使用对应 nodal Dirichlet data，离散 harmonic solve 都恢复同一个 affine field；每个
+face 的梯度完全相同，于是
 
 \[
-L=0.
+L_{\mathrm{uniform}}=0.
 \]
 
-由于 uniformity loss 非负，达到 0 就证明这是一个 global optimum，而不只是“看起来
-不错的局部解”。
+由于 \(L_{\mathrm{uniform}}\ge0\)，这不仅是局部最优，而是 global optimum。
 
-![Plane 四角对应的仿射零-loss 解](docs/figures/linear-plane-four-corners-polyscope.png)
+![Plane 四角对应的 affine 零-loss 场](docs/figures/linear-plane-four-corners-polyscope.png)
 
-不过“存在可证明的全局解”不代表局部 SLSQP 总能找到它。当前每个 seed 都运行两个
-互补坐标图；16-seed 结果为：
+这个证明说明“最优解是什么”，但不说明任意局部算法从任意随机初值都能到达它。SLSQP
+和 SPG 仍可能停在其他 stationary point 或 minimum-gap active face。判断实现是否健康时，
+应至少做三类检查：
 
-- best：`7.08e-14`；
-- 12/16 个 seeds 达到 `<1e-10`；
-- median：`2.71e-13`；
-- worst：`0.0024536`。
+1. 直接把理论四角 knots 输入 `loss_and_knot_gradient`，验证 loss 接近离散精度极限；
+2. 从四角附近扰动初值，验证两个 backend 能回到该 basin；
+3. 扫描随机 seeds，区分“理论解不存在”“离散实现错误”和“局部优化没有进入正确 basin”。
 
-seed 0 达到约 `1.96e-13`，但其他初值仍可能进入 minimum-gap active face 上的局部 basin。Plane
-理论解可以证明，优化器的全局收敛性不能证明。
-
-### 13.1 与 partial/Wentzell Plane 的区别
-
-两套模型都可以得到同一个 affine field，但理由不同：
-
-- linear all-boundary：上下边的线性 trace 是预先规定的；
-- partial/Wentzell：上下边的中间值是 PDE state 的一部分，恰好自动解成同一 affine
-  trace。
-
-相同的最终图片不代表相同的 boundary condition。
+若第一项失败，应优先检查 boundary ordering、角点位置、profile orientation、cotangent
+operator 和 mesh 几何；这时不能把问题归因于局部优化器。
 
 ---
 
-## 14. 为什么 Disk 通常比 pure Neumann partial 版本更低？
+## 17. 可微性、驻点与已知限制
 
-在光滑 Disk 边界上突然从 hard Dirichlet 切到 free Neumann，junction 附近容易出现很强
-的梯度集中。线性全边界版本没有这种 D/N condition switch：transition arcs 上的
-Dirichlet 值连续地从 0 变化到 1，再从 1 变化到 0，因此 field 更 regular。
+当每个 boundary vertex 固定处于 profile 的同一分段，并且 \(\mu>0\) 时：
 
-这解释了当前 mesh 上的典型结果：
-
-- linear all-boundary：约 `0.0278–0.0298`；
-- pure partial Neumann：约 `0.693`；
-- Wentzell `eta=3`：约 `0.030688`。
-
-但这不是免费的改进。linear 版本通过更强的建模假设——预先规定 transition——换来了
-更平滑的解和更简单的优化结构。
-
-在 `triple_peak.obj` 上，当前 16-seed linear 结果为 best `0.349744`、median
-`0.350605`、worst `0.412081`。这说明即使边界 trace 很平滑，复杂的内部几何仍然会
-限制 gradient uniformity。
-
----
-
-## 15. “完全可微”需要加什么限定？
-
-固定每个 boundary vertex 位于 profile 的哪一段且 \(\mu>0\) 时：
-
-- direct gaps 到 knots 是固定仿射映射；
+- centered phase/full-gap 到 knots 的映射有解析 Jacobian；
 - boundary samples 对 knots 解析可微；
 - \(\boldsymbol u=E\boldsymbol z\) 是固定线性映射；
-- face gradient 和 uniformity loss 可微；
-- adjoint gradient 与该离散模型的 chain rule 精确一致。
+- face gradients、loss 和 adjoint gradient 都可微。
 
-但当某个 knot 穿过原始 boundary vertex 时，该顶点会从 plateau branch 切换到 linear
-branch，或者反过来。profile 值连续，但参数导数一般会跳变。因此更准确的说法是：
+但 knot 穿过一个原始 boundary vertex 时，该顶点会切换 profile branch。函数值仍然连续，
+参数导数通常会跳变。因此更准确的说法是：
 
-> 当前 pipeline 在固定 boundary-profile cell 内解析可微，整体是连续、分片光滑的；
-> 它不是全局 \(C^1\) 或 \(C^2\) 目标。
+> 离散 objective 在固定 boundary-profile cell 内解析可微，整体连续且分片光滑，但不是
+> 全局 \(C^1\) 目标。
 
-SLSQP 在实践中通常可以穿过这些低维 kink，但这不是通用的光滑优化理论保证。
+simplex projection 在 active set 改变时也不是处处光滑；SPG 只需要执行投影，不需要对
+整个优化轨迹反向传播。
 
----
+当前实现的主要限制是：
 
-## 16. 两个版本的一页对照
-
-| 问题 | Linear all-boundary | Continuous partial / Wentzell |
-|---|---|---|
-| 代码 | `boundary_opt.py` | `continuous_partial_opt.py` |
-| hard values | 整条边界全部已知 | 只有 \(\Gamma_0,\Gamma_1\) 已知 |
-| transition | prescribed arclength-linear | 中间值由联立 PDE 求解 |
-| free boundary condition | 没有 free boundary | `eta=0` 为 Neumann；`eta>0` 为 Wentzell |
-| endpoint 表达 | 连续 knot，但只采样原 boundary vertices | 连续 endpoint + 局部 cut integration |
-| state matrix | 固定 \(K_{II}\) | 随 endpoints 的局部 assembly 改变 |
-| factorization | 初始化一次 | 当前实现每次 state evaluation 更新 |
-| outer gradient | 手写 exact adjoint | 当前参考实现为 SLSQP finite difference |
-| outer solver | exact-gradient constrained SLSQP | constrained SLSQP + candidates/multi-start |
-| Disk 典型 loss | `0.0278–0.0298` | `eta=0`: `~0.693`; `eta=3`: `0.030688` |
-| Plane 四角 | affine 零解 | 同样可得 affine 零解，但 free trace 是自动求出的 |
-
-选择哪一版取决于建模语义，而不是只看 Disk 上谁的 loss 更小：
-
-- 如果允许完整边界 trace 由四参数直接规定，linear 版本最简单、最快、梯度最干净；
-- 如果 transition 必须由 PDE 自动决定，应使用 partial/Wentzell 版本。
+1. **完整 profile 被规定**：四个 endpoints 决定包括两段斜坡在内的整圈 trace。
+2. **没有 edge 内精确 breakpoint**：连续 knot 只通过原 boundary-vertex samples 影响场。
+3. **Loss 是 spacing proxy**：不直接测真实 isoline distance、形状或拓扑。
+4. **Scale invariance**：0 到 1 由 boundary data 保证，不由 CV loss 推出。
+5. **局部优化**：SLSQP 与 SPG 都可能收敛到非全局 basin。
+6. **Active constraints**：达到 \(g_i=\delta\) 可以是合法 KKT 点，也可能是不理想的局部点。
+7. **Width prior 改变问题**：只能与相同 prior 设置的结果比较。
+8. **Maximum principle 的离散条件**：一般非 Delaunay cotangent mesh 可能轻微 overshoot，
+   应实际报告 field range。
+9. **拓扑限制**：当前只接受一个 manifold boundary loop，且必须存在 interior vertices。
+10. **分辨率依赖**：边界采样、face moments 与最优 knots 可能随 refinement 改变。
 
 ---
 
-## 17. 已知限制
+## 18. 代码地图与复现命令
 
-1. **Prescribed transition**：核心限制。两段中间 boundary trace 不是自动求出的。
-2. **没有 edge 内精确 breakpoint**：连续 knot 只通过 original-vertex samples 影响场。
-3. **Active constraint**：闭合 simplex 能达到最小 gap，但边界 KKT 点仍可能是次优局部解。
-4. **仅分片光滑**：knot 穿过 boundary vertex 时导数跳变。
-5. **Loss 只是 spacing proxy**：不直接测量真实 isoline distance、形状或拓扑。
-6. **局部优化**：SLSQP 不保证全局最优；random-seed scan 只是数值证据。
-7. **Width prior 会改变问题**：不能把带 prior 和不带 prior 的 loss 混为一谈。
-8. **离散 maximum principle 不总成立**：一般非 Delaunay cotangent mesh 可能产生轻微
-   overshoot，应实际报告 `field.min/max`。
-9. **拓扑限制**：只接受一个 manifold boundary loop，并且必须存在 interior vertices。
-10. **网格分辨率依赖**：boundary sampling、face gradient moments 和最优 knots 都可能随
-    refinement 改变。
+### 18.1 文件职责
 
----
-
-## 18. 代码地图
-
-| 数学步骤 | 实现 |
+| 文件 | 职责 |
 |---|---|
-| 读取 OBJ | [`load_obj`](boundary_opt.py#L73) |
-| 找唯一 boundary loop | [`boundary_loop`](boundary_opt.py#L103) |
-| 归一化三维 boundary arclength | [`boundary_arclength`](boundary_opt.py#L144) |
-| 生成分片线性完整 trace | [`cyclic_boundary_profile`](boundary_opt.py#L154) |
-| closed simplex 与常量 knot Jacobian | [`knots_from_parameters`](boundary_opt.py#L194) |
-| cotangent stiffness | [`cotangent_stiffness`](boundary_opt.py#L246) |
-| face gradient basis | [`face_gradient_basis`](boundary_opt.py#L276) |
-| 固定 block 与一次 LU factorization | [`HarmonicBoundaryOptimizer.__init__`](boundary_opt.py#L303) |
-| forward harmonic extension | [`extend`](boundary_opt.py#L360) |
-| transpose/adjoint extension | [`extend_adjoint`](boundary_opt.py#L373) |
-| uniformity loss 和 \(\partial L/\partial u\) | [`_loss_and_field_gradient`](boundary_opt.py#L387) |
-| 可选 width prior | [`_width_loss_and_gradient`](boundary_opt.py#L425) |
-| 完整四维 gradient | [`loss_and_gradient`](boundary_opt.py#L446) |
-| exact-gradient SLSQP outer solve | [`optimize`](boundary_opt.py#L462) |
+| [`boundary_opt/mesh.py`](boundary_opt/mesh.py) | OBJ、边界拓扑、弧长、cotangent FEM 几何 |
+| [`boundary_opt/harmonic.py`](boundary_opt/harmonic.py) | harmonic 预分解、正向求解与 adjoint |
+| [`boundary_opt/boundary.py`](boundary_opt/boundary.py) | knots、gaps、profile 与 center/full-gap 转换 |
+| [`boundary_opt/simplex.py`](boundary_opt/simplex.py) | closed simplex、projection 与 KKT residual |
+| [`boundary_opt/loss.py`](boundary_opt/loss.py) | uniformity loss、width prior 与场统计 |
+| [`boundary_opt/optimizer.py`](boundary_opt/optimizer.py) | objective、evaluation cache、结果与 backend dispatch |
+| [`boundary_opt/slsqp_backend.py`](boundary_opt/slsqp_backend.py) | exact-gradient constrained SLSQP |
+| [`boundary_opt/spg_backend.py`](boundary_opt/spg_backend.py) | BB1 SPG 与 nonmonotone Armijo |
+| [`boundary_opt/__init__.py`](boundary_opt/__init__.py) | 稳定的 public API |
+| [`scan_mesh_seeds.py`](scan_mesh_seeds.py) | 随机种子扫描与 CSV history |
+| [`plot_loss_curves.py`](plot_loss_curves.py) | 从 history CSV 生成 loss curves |
+| [`visualize_mesh_optimization.py`](visualize_mesh_optimization.py) | Polyscope 最终场、前后图与动画 |
 
----
-
-## 19. 如何复现
-
-### 19.1 测试离散算子、adjoint 和完整 gradient
+### 18.2 运行全部测试
 
 ```bash
-uv run pytest tests/test_boundary_opt.py
+uv run pytest
 ```
 
-测试覆盖：
+测试应覆盖 boundary profile Jacobian、FEM energy、`solve`/`solve_adjoint` transpose
+identity、完整参数 gradient、simplex projection、两个 backend 和 Plane affine 解。
 
-- boundary profile Jacobian 对 finite difference；
-- `extend` / `extend_adjoint` 的 transpose identity；
-- cotangent energy 与 face-gradient energy 一致；
-- 完整四维 analytic gradient 对 finite difference；
-- Plane 四角 affine 零解；
-- Disk 和 Triple Peak 的端到端优化。
-
-### 19.2 扫描 Disk 的 16 个随机 seeds
+### 18.3 在 Disk 上分别扫描两个 backend
 
 ```bash
 uv run python scan_mesh_seeds.py \
   --mesh data/disk.obj \
+  --backend slsqp \
   --seeds 16 \
-  --iterations 100 \
-  --output output/closed_simplex_disk_seed_scan.csv \
-  --history-output output/closed_simplex_disk_seed_scan_history.csv
+  --iterations 100
+
+uv run python scan_mesh_seeds.py \
+  --mesh data/disk.obj \
+  --backend spg \
+  --seeds 16 \
+  --iterations 100
 ```
 
-### 19.3 扫描 Plane
+默认输出分别写到 backend-specific CSV，避免互相覆盖。
+
+### 18.4 扫描 Plane 与 Triple Peak
 
 ```bash
 uv run python scan_mesh_seeds.py \
   --mesh data/plane.obj \
+  --backend slsqp \
   --seeds 16 \
-  --iterations 100 \
-  --output output/closed_simplex_plane_seed_scan.csv \
-  --history-output output/closed_simplex_plane_seed_scan_history.csv
+  --iterations 100
+
+uv run python scan_mesh_seeds.py \
+  --mesh data/triple_peak.obj \
+  --backend spg \
+  --seeds 16 \
+  --iterations 100
 ```
 
-### 19.4 画 loss curves
+### 18.5 画两个 backend 的 Disk loss curves
 
 ```bash
 uv run python plot_loss_curves.py \
-  --history Disk output/closed_simplex_disk_seed_scan_history.csv \
-  --history Plane output/closed_simplex_plane_seed_scan_history.csv \
-  --title "Linear all-boundary · 16 seeds" \
-  --svg docs/figures/linear-disk-plane-loss-curves.svg
+  --history "Disk · SLSQP" output/disk_slsqp_seed_scan_history.csv \
+  --history "Disk · SPG" output/disk_spg_seed_scan_history.csv \
+  --title "Disk · centered full-gap backends" \
+  --svg output/disk_backend_loss_curves.svg
 ```
 
-### 19.5 重建本文的 Disk 图片
+history 是 accepted feasible iterates，不是每一次内部 objective evaluation。曲线允许局部
+上升；最终点与返回结果保持一致。
+
+### 18.6 打开标准 Polyscope panel，只看最终 Disk
 
 ```bash
 uv run --extra visualization python visualize_mesh_optimization.py \
   --mesh data/disk.obj \
+  --backend slsqp \
   --seed 0 \
   --iterations 100 \
   --final-only \
-  --screenshot docs/figures/linear-disk-final-polyscope.png
+  --show
 ```
 
-### 19.6 重建本文的 Plane 四角图片
+换成 `--backend spg` 即可查看另一后端。去掉 `--show` 时会保存截图后退出。
 
-```bash
-uv run --extra visualization python visualize_mesh_optimization.py \
-  --mesh data/plane.obj \
-  --seed 0 \
-  --iterations 100 \
-  --final-only \
-  --screenshot docs/figures/linear-plane-four-corners-polyscope.png
-```
-
-### 19.7 交互查看或播放 recorded optimization history
-
-在上述静态命令末尾添加 `--show` 可以保留正常 Polyscope panel。要播放 Disk 的优化
-过程，运行：
+### 18.7 播放优化动画
 
 ```bash
 uv run --extra visualization python visualize_mesh_optimization.py \
   --mesh data/disk.obj \
+  --backend spg \
   --seed 0 \
   --iterations 100 \
   --animate \
   --fps 8
 ```
 
+动画播放的是 `parameter_history` 中保存的可行 states，并保证最后一帧对应返回场。
+
+### 18.8 查看 Plane 最终结果
+
+```bash
+uv run --extra visualization python visualize_mesh_optimization.py \
+  --mesh data/plane.obj \
+  --backend slsqp \
+  --seed 0 \
+  --iterations 100 \
+  --final-only \
+  --show
+```
+
 ---
 
-## 20. 最后一张公式卡
+## 19. 最后一张公式卡
+
+边界坐标与约束：
+
+\[
+\boxed{
+\boldsymbol p=(c,g_0,g_1,g_2,g_3),
+\qquad
+g_i\ge\delta,
+\qquad
+\sum_i g_i=1
+}
+\]
+
+五个存储坐标、一个等式，所以是四个独立自由度。
 
 前向：
 
 \[
 \boxed{
-\boldsymbol z=g(\boldsymbol\theta(\boldsymbol p)),
+\boldsymbol z=h_{\boldsymbol\theta(\boldsymbol p)}(\boldsymbol\xi),
 \qquad
 \boldsymbol u=E\boldsymbol z,
 \qquad
 L=\operatorname{CV}_{A}^{2}(\lVert\nabla u\rVert^2)
++L_{\mathrm{width}}
 }
 \]
 
@@ -962,9 +1043,10 @@ L=\operatorname{CV}_{A}^{2}(\lVert\nabla u\rVert^2)
 
 \[
 \boxed{
-K_{II}^{T}\boldsymbol\lambda=\boldsymbol q_I,
+K_{II}^{T}\boldsymbol\lambda=\boldsymbol s_I,
 \qquad
-E^T\boldsymbol q=\boldsymbol q_B-K_{IB}^T\boldsymbol\lambda
+E^T\boldsymbol s
+=\boldsymbol s_B-K_{IB}^T\boldsymbol\lambda
 }
 \]
 
@@ -981,6 +1063,17 @@ E^T\nabla_{\boldsymbol u}L
 }
 \]
 
-这套方法最优雅的地方，是把高维 state 压缩成固定的线性 harmonic extension，并用一次
-adjoint backsolve 把梯度传回四个参数。它的代价也同样明确：包括 transition 在内的
-完整 boundary trace 已经由四个 knots 预先规定。
+约束驻点诊断：
+
+\[
+\boxed{
+r_{\mathrm{PG}}
+=\left\|
+\boldsymbol p-\Pi(\boldsymbol p-\nabla L)
+\right\|_\infty
+}
+\]
+
+这套实现最核心的简洁性来自三点：四个 endpoints 始终是连续设计量；高维 field 始终由
+固定 harmonic operator 精确消去；两个可互换 backend 共享同一套解析 adjoint gradient
+和同一个完整 gap simplex。

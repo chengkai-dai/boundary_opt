@@ -7,18 +7,17 @@ from pathlib import Path
 
 import numpy as np
 
-from boundary_opt import (
-    HarmonicBoundaryOptimizer,
+from boundary_opt import BoundaryOptimizer, load_obj, random_knots
+from boundary_opt.boundary import (
     cyclic_boundary_profile,
     knots_from_parameters,
-    load_obj,
-    random_knots,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mesh", type=Path, default=Path("data/disk.obj"))
+    parser.add_argument("--backend", choices=("slsqp", "spg"), default="slsqp")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--minimum-gap", type=float, default=0.03)
@@ -63,7 +62,7 @@ def add_field_quantity(surface: object, field: np.ndarray) -> None:
 
 def register_surface(
     ps: object,
-    optimizer: HarmonicBoundaryOptimizer,
+    optimizer: BoundaryOptimizer,
     label: str,
     vertices: np.ndarray,
     field: np.ndarray,
@@ -97,7 +96,7 @@ def plateau_segments(
 
 def register_state(
     ps: object,
-    optimizer: HarmonicBoundaryOptimizer,
+    optimizer: BoundaryOptimizer,
     display_vertices: np.ndarray,
     label: str,
     field: np.ndarray,
@@ -107,7 +106,7 @@ def register_state(
     vertices = display_vertices + offset
     register_surface(ps, optimizer, label, vertices, field)
 
-    boundary_points = vertices[optimizer.boundary_vertices]
+    boundary_points = vertices[optimizer.harmonic.boundary_vertices]
     for name, target, color in (
         ("min = 0", 0.0, (0.08, 0.28, 0.95)),
         ("max = 1", 1.0, (0.95, 0.24, 0.08)),
@@ -135,7 +134,7 @@ def boundary_edge_colors(values: np.ndarray) -> np.ndarray:
 
 def register_animation_state(
     ps: object,
-    optimizer: HarmonicBoundaryOptimizer,
+    optimizer: BoundaryOptimizer,
     display_vertices: np.ndarray,
     label: str,
     field: np.ndarray,
@@ -144,7 +143,7 @@ def register_animation_state(
 ) -> tuple[object, object]:
     vertices = display_vertices + offset
     surface = register_surface(ps, optimizer, label, vertices, field)
-    boundary_points = vertices[optimizer.boundary_vertices]
+    boundary_points = vertices[optimizer.harmonic.boundary_vertices]
     boundary = ps.register_curve_network(
         f"{label} · boundary",
         boundary_points,
@@ -162,7 +161,7 @@ def register_animation_state(
 
 
 def optimization_frames(
-    optimizer: HarmonicBoundaryOptimizer, parameter_history: np.ndarray
+    optimizer: BoundaryOptimizer, parameter_history: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
     """Evaluate fields and colors along the public feasible-state record."""
     fields = []
@@ -171,12 +170,11 @@ def optimization_frames(
         knots, _, _ = knots_from_parameters(
             parameters,
             optimizer.minimum_gap,
-            enforce_minimum_gap=False,
         )
         boundary_values, _ = cyclic_boundary_profile(
             optimizer.boundary_positions, knots
         )
-        fields.append(optimizer.extend(boundary_values))
+        fields.append(optimizer.harmonic.solve(boundary_values))
         colors.append(boundary_edge_colors(boundary_values))
     return np.stack(fields), np.stack(colors)
 
@@ -326,7 +324,7 @@ def main() -> None:
         ) from exc
 
     mesh = load_obj(args.mesh)
-    optimizer = HarmonicBoundaryOptimizer(
+    optimizer = BoundaryOptimizer(
         mesh,
         minimum_gap=args.minimum_gap,
         target_arc_width=args.target_arc_width,
@@ -336,9 +334,10 @@ def main() -> None:
     initial_boundary, _ = cyclic_boundary_profile(
         optimizer.boundary_positions, initial_knots
     )
-    initial_field = optimizer.extend(initial_boundary)
+    initial_field = optimizer.harmonic.solve(initial_boundary)
     result = optimizer.optimize(
         initial_knots,
+        backend=args.backend,
         max_iterations=args.iterations,
         seed=args.seed,
     )
@@ -379,7 +378,7 @@ def main() -> None:
             ps,
             optimizer,
             display_vertices,
-            "optimization trajectory",
+            f"{args.backend} trajectory",
             fields[0],
             colors[0],
             translation,
@@ -400,7 +399,8 @@ def main() -> None:
             )
         )
         print(
-            f"seed={args.seed} loss {result.initial_loss:.6f} -> "
+            f"backend={args.backend} seed={args.seed} loss "
+            f"{result.initial_loss:.6f} -> "
             f"{result.final_loss:.6f}; playing {len(fields)} feasible states"
         )
         ps.show()
@@ -414,20 +414,21 @@ def main() -> None:
             ps,
             optimizer,
             display_vertices,
-            f"optimized · seed {args.seed}",
+            f"optimized · {args.backend} · seed {args.seed}",
             result.field,
             optimized_boundary,
             np.zeros(3),
         )
         ps.look_at(center + np.asarray([0.0, 5.5 * extent, 2.0 * extent]), center)
         screenshot = args.screenshot or Path("output") / (
-            f"{args.mesh.stem}_optimized_polyscope.png"
+            f"{args.mesh.stem}_{args.backend}_optimized_polyscope.png"
         )
         screenshot.parent.mkdir(parents=True, exist_ok=True)
         ps.show(forFrames=5)
         ps.screenshot(str(screenshot), transparent_bg=False, include_UI=True)
         print(
-            f"seed={args.seed} optimized loss={result.final_loss:.6f}; "
+            f"backend={args.backend} seed={args.seed} "
+            f"optimized loss={result.final_loss:.6f}; "
             f"wrote {screenshot}"
         )
         if args.show:
@@ -447,7 +448,7 @@ def main() -> None:
         ps,
         optimizer,
         display_vertices,
-        "after",
+        f"after · {args.backend}",
         result.field,
         optimized_boundary,
         translation,
@@ -464,13 +465,14 @@ def main() -> None:
     )
 
     screenshot = args.screenshot or Path("output") / (
-        f"{args.mesh.stem}_before_after_polyscope.png"
+        f"{args.mesh.stem}_{args.backend}_before_after_polyscope.png"
     )
     screenshot.parent.mkdir(parents=True, exist_ok=True)
     ps.show(forFrames=5)
     ps.screenshot(str(screenshot), transparent_bg=False, include_UI=True)
     print(
-        f"seed={args.seed} loss {result.initial_loss:.6f} -> {result.final_loss:.6f}; "
+        f"backend={args.backend} seed={args.seed} loss "
+        f"{result.initial_loss:.6f} -> {result.final_loss:.6f}; "
         f"wrote {screenshot}"
     )
     if args.show:

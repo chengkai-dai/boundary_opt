@@ -1,4 +1,4 @@
-"""Plot one or more CSV or NPZ optimization histories as SVG."""
+"""Plot one or more optimization-history CSV files as SVG."""
 
 from __future__ import annotations
 
@@ -10,8 +10,6 @@ from pathlib import Path
 from statistics import median
 from xml.sax.saxutils import escape
 
-import numpy as np
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -20,29 +18,18 @@ def parse_args() -> argparse.Namespace:
         nargs=2,
         action="append",
         metavar=("LABEL", "FILE"),
-        help="repeat for each panel; input may be a history CSV or result NPZ",
+        help="repeat for each CSV panel",
     )
     parser.add_argument("--title", default="Harmonic boundary optimization")
     parser.add_argument("--svg", type=Path, default=Path("output/loss_curves.svg"))
-    parser.add_argument("--html", type=Path)
     return parser.parse_args()
 
 
 def read_histories(path: Path) -> dict[int, list[float]]:
-    if path.suffix.lower() == ".npz":
-        with np.load(path) as result:
-            history = np.asarray(result["history"], dtype=np.float64)
-        if history.ndim != 1 or len(history) == 0:
-            raise ValueError("NPZ history must be a non-empty vector")
-        return {0: history.tolist()}
-
     histories: defaultdict[int, list[tuple[int, float]]] = defaultdict(list)
     with path.open(encoding="utf-8") as stream:
         for row in csv.DictReader(stream):
-            record_key = "record" if "record" in row else "iteration"
-            histories[int(row["seed"])].append(
-                (int(row[record_key]), float(row["loss"]))
-            )
+            histories[int(row["seed"])].append((int(row["record"]), float(row["loss"])))
     return {
         seed: [value for _, value in sorted(points)]
         for seed, points in sorted(histories.items())
@@ -57,7 +44,6 @@ def chart_svg(
     panels: list[tuple[str, dict[int, list[float]]]],
     *,
     title: str,
-    themed: bool,
 ) -> str:
     width, height = max(760, 390 * len(panels) + 90), 470
     left, right, top, bottom, gap = 66, 24, 38, 58, 58
@@ -88,23 +74,13 @@ def chart_svg(
     y_ticks = [value for value in candidate_ticks if lower <= value <= upper]
     x_ticks = list(range(0, maximum_record + 1, 10))
 
-    colors = (
-        {
-            "text": "var(--foreground)",
-            "muted": "var(--muted-foreground)",
-            "grid": "var(--border)",
-            "peer": "var(--muted-foreground)",
-            "median": "var(--viz-series-1)",
-        }
-        if themed
-        else {
-            "text": "#202124",
-            "muted": "#667085",
-            "grid": "#d9dee7",
-            "peer": "#98a2b3",
-            "median": "#2563eb",
-        }
-    )
+    colors = {
+        "text": "#202124",
+        "muted": "#667085",
+        "grid": "#d9dee7",
+        "peer": "#98a2b3",
+        "median": "#2563eb",
+    }
 
     def x_coordinate(record: int, panel: int) -> float:
         return (
@@ -122,10 +98,9 @@ def chart_svg(
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}" style="width:100%;height:auto;display:block" role="img" aria-labelledby="loss-title loss-desc">',
         f'<title id="loss-title">{escape(title)} loss curves</title>',
         '<desc id="loss-desc">Recorded optimization histories; thin lines are runs and the thick line is the pointwise median. Shorter histories hold their last value. The vertical axis is logarithmic.</desc>',
+        f'<rect width="{width}" height="{height}" fill="#ffffff"/>',
+        '<g fill="none" stroke-linecap="round" stroke-linejoin="round">',
     ]
-    if not themed:
-        parts.append(f'<rect width="{width}" height="{height}" fill="#ffffff"/>')
-    parts.append('<g fill="none" stroke-linecap="round" stroke-linejoin="round">')
     for panel, (label, histories) in enumerate(panels):
         x0 = left + panel * (panel_width + gap)
         for tick in y_ticks:
@@ -189,23 +164,13 @@ def chart_svg(
 def main() -> None:
     args = parse_args()
     requested = args.history or [
-        ("Disk · width prior", "output/disk_seed_scan_history.csv"),
-        ("Disk · no width prior", "output/disk_seed_scan_unregularized_history.csv"),
+        ("Disk · SLSQP", "output/disk_slsqp_seed_scan_history.csv"),
+        ("Disk · SPG", "output/disk_spg_seed_scan_history.csv"),
     ]
     panels = [(label, read_histories(Path(path))) for label, path in requested]
     args.svg.parent.mkdir(parents=True, exist_ok=True)
-    args.svg.write_text(
-        chart_svg(panels, title=args.title, themed=False), encoding="utf-8"
-    )
-    if args.html is not None:
-        args.html.parent.mkdir(parents=True, exist_ok=True)
-        fragment = (
-            '<div id="mesh-loss-benchmark" style="width:100%;color:var(--foreground)">\n'
-            + chart_svg(panels, title=args.title, themed=True)
-            + "\n</div>\n"
-        )
-        args.html.write_text(fragment, encoding="utf-8")
-    print(f"wrote {args.svg}" + (f" and {args.html}" if args.html else ""))
+    args.svg.write_text(chart_svg(panels, title=args.title), encoding="utf-8")
+    print(f"wrote {args.svg}")
 
 
 if __name__ == "__main__":

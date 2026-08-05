@@ -10,5 +10,4 @@ __pycache__/
 imgui.ini
 
 # Generated experiment output
-output/*
-!output/wentzell_eta3_disk_final_polyscope.png
+output/

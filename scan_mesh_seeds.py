@@ -9,12 +9,13 @@ from pathlib import Path
 
 import numpy as np
 
-from boundary_opt import HarmonicBoundaryOptimizer, load_obj, random_knots
+from boundary_opt import BoundaryOptimizer, load_obj, random_knots
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mesh", type=Path, default=Path("data/disk.obj"))
+    parser.add_argument("--backend", choices=("slsqp", "spg"), default="slsqp")
     parser.add_argument("--seeds", type=int, default=16, help="scan seeds [0, N)")
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--minimum-gap", type=float, default=0.03)
@@ -31,7 +32,7 @@ def main() -> None:
         raise SystemExit("--seeds must be positive")
     start = time.perf_counter()
     mesh = load_obj(args.mesh)
-    optimizer = HarmonicBoundaryOptimizer(
+    optimizer = BoundaryOptimizer(
         mesh,
         minimum_gap=args.minimum_gap,
         target_arc_width=args.target_arc_width,
@@ -40,7 +41,8 @@ def main() -> None:
     setup_seconds = time.perf_counter() - start
     print(
         f"mesh={args.mesh} V={len(mesh.vertices)} F={len(mesh.faces)} "
-        f"boundary={len(optimizer.boundary_vertices)} setup={setup_seconds:.4f}s"
+        f"boundary={len(optimizer.harmonic.boundary_vertices)} "
+        f"setup={setup_seconds:.4f}s"
     )
 
     rows: list[dict[str, int | float | str]] = []
@@ -50,6 +52,7 @@ def main() -> None:
         start = time.perf_counter()
         result = optimizer.optimize(
             initial,
+            backend=args.backend,
             max_iterations=args.iterations,
             seed=seed,
         )
@@ -57,9 +60,10 @@ def main() -> None:
         reduction = 1.0 - result.final_loss / result.initial_loss
         row: dict[str, int | float | str] = {
             "mesh": str(args.mesh),
+            "backend": args.backend,
             "vertices": len(mesh.vertices),
             "faces": len(mesh.faces),
-            "boundary_vertices": len(optimizer.boundary_vertices),
+            "boundary_vertices": len(optimizer.harmonic.boundary_vertices),
             "setup_seconds": setup_seconds,
             "seed": seed,
             "minimum_gap": args.minimum_gap,
@@ -72,8 +76,6 @@ def main() -> None:
             "reduction": reduction,
             "iterations": result.iterations,
             "evaluations": result.evaluations,
-            "total_evaluations": result.total_evaluations,
-            "success": int(result.success),
             "gradient_norm": result.gradient_norm,
             "kkt_residual": result.kkt_residual,
             "constraint_violation": result.constraint_violation,
@@ -84,7 +86,6 @@ def main() -> None:
             "plateau_at_minimum": int(
                 min(result.gaps[0], result.gaps[2]) <= args.minimum_gap + 1.0e-4
             ),
-            "message": result.message,
         }
         row.update(
             {
@@ -105,15 +106,17 @@ def main() -> None:
             for record, loss in enumerate(result.history)
         )
         print(
-            f"seed={seed:02d} loss {result.initial_loss:.6f} -> {result.final_loss:.6f} "
+            f"backend={args.backend} seed={seed:02d} loss "
+            f"{result.initial_loss:.6f} -> {result.final_loss:.6f} "
             f"({100.0 * reduction:6.2f}%) uniform={result.uniformity_loss:.6f} "
             f"width={result.width_loss:.6f} cv={result.statistics.spacing_cv:.4f} "
             f"iter={result.iterations:02d} kkt={result.kkt_residual:.2e} "
-            f"time={optimize_seconds:.4f}s "
-            f"success={result.success}"
+            f"time={optimize_seconds:.4f}s"
         )
 
-    output = args.output or Path("output") / f"{args.mesh.stem}_seed_scan.csv"
+    output = args.output or Path("output") / (
+        f"{args.mesh.stem}_{args.backend}_seed_scan.csv"
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
