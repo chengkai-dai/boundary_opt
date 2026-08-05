@@ -16,7 +16,7 @@ from .boundary import (
 )
 from .defaults import (
     DEFAULT_AREA_WEIGHT,
-    DEFAULT_ISOLINE_WEIGHT,
+    DEFAULT_LENGTH_SMOOTHNESS_WEIGHT,
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_MINIMUM_GAP,
     DEFAULT_UNIFORMITY_WEIGHT,
@@ -25,7 +25,7 @@ from .harmonic import HarmonicField
 from .loss import (
     FieldStatistics,
     area_balance_loss_and_gradient,
-    isoline_length_loss_and_gradient,
+    length_smoothness_loss_and_gradient,
     uniformity_loss_and_gradient,
 )
 from .mesh import (
@@ -53,7 +53,7 @@ class OptimizationResult:
     final_loss: float
     uniformity_loss: float
     area_loss: float
-    isoline_loss: float
+    length_smoothness_loss: float
     history: FloatArray
     parameter_history: FloatArray
     parameters: FloatArray
@@ -73,7 +73,7 @@ class _Evaluation:
     loss: float
     uniformity_loss: float
     area_loss: float
-    isoline_loss: float
+    length_smoothness_loss: float
     knot_gradient: FloatArray
     field: FloatArray
     statistics: FieldStatistics
@@ -114,7 +114,7 @@ class BoundaryOptimizer:
         minimum_gap: float = DEFAULT_MINIMUM_GAP,
         uniformity_weight: float = DEFAULT_UNIFORMITY_WEIGHT,
         area_weight: float = DEFAULT_AREA_WEIGHT,
-        isoline_weight: float = DEFAULT_ISOLINE_WEIGHT,
+        length_smoothness_weight: float = DEFAULT_LENGTH_SMOOTHNESS_WEIGHT,
     ) -> None:
         if not np.isfinite(minimum_gap) or not 0.0 < minimum_gap < 0.25:
             raise ValueError("minimum_gap must lie in (0, 0.25)")
@@ -122,21 +122,30 @@ class BoundaryOptimizer:
             raise ValueError("area_weight must be finite and non-negative")
         if not np.isfinite(uniformity_weight) or uniformity_weight < 0.0:
             raise ValueError("uniformity_weight must be finite and non-negative")
-        if not np.isfinite(isoline_weight) or isoline_weight < 0.0:
-            raise ValueError("isoline_weight must be finite and non-negative")
+        if (
+            not np.isfinite(length_smoothness_weight)
+            or length_smoothness_weight < 0.0
+        ):
+            raise ValueError(
+                "length_smoothness_weight must be finite and non-negative"
+            )
 
         self.mesh = mesh
         self.minimum_gap = float(minimum_gap)
         self.uniformity_weight = float(uniformity_weight)
         self.area_weight = float(area_weight)
-        self.isoline_weight = float(isoline_weight)
+        self.length_smoothness_weight = float(length_smoothness_weight)
         self._weight_scale = max(
-            self.uniformity_weight, self.area_weight, self.isoline_weight
+            self.uniformity_weight, self.area_weight, self.length_smoothness_weight
         )
         if self._weight_scale == 0.0:
             raise ValueError("at least one loss weight must be positive")
         self._relative_weights = np.asarray(
-            [self.uniformity_weight, self.area_weight, self.isoline_weight]
+            [
+                self.uniformity_weight,
+                self.area_weight,
+                self.length_smoothness_weight,
+            ]
         ) / self._weight_scale
         self.harmonic = HarmonicField(mesh)
         self.boundary_positions = boundary_arclength(
@@ -160,17 +169,21 @@ class BoundaryOptimizer:
         area_loss, area_sensitivity = area_balance_loss_and_gradient(
             field, self.mesh.faces, self._face_weights
         )
-        isoline_loss, isoline_sensitivity = isoline_length_loss_and_gradient(
-            field,
-            self.mesh.faces,
-            self._gradient_basis,
-            self._face_weights,
+        length_smoothness_loss, length_smoothness_sensitivity = (
+            length_smoothness_loss_and_gradient(
+                field,
+                self.mesh.faces,
+                self._gradient_basis,
+                self._face_weights,
+            )
         )
-        uniformity_weight, area_weight, isoline_weight = self._relative_weights
+        uniformity_weight, area_weight, length_smoothness_weight = (
+            self._relative_weights
+        )
         field_sensitivity = (
             uniformity_weight * field_sensitivity
             + area_weight * area_sensitivity
-            + isoline_weight * isoline_sensitivity
+            + length_smoothness_weight * length_smoothness_sensitivity
         )
         boundary_sensitivity = self.harmonic.solve_adjoint(field_sensitivity)
         knot_gradient = profile_jacobian.T @ boundary_sensitivity
@@ -179,11 +192,11 @@ class BoundaryOptimizer:
             loss=(
                 uniformity_weight * uniformity_loss
                 + area_weight * area_loss
-                + isoline_weight * isoline_loss
+                + length_smoothness_weight * length_smoothness_loss
             ),
             uniformity_loss=uniformity_loss,
             area_loss=area_loss,
-            isoline_loss=isoline_loss,
+            length_smoothness_loss=length_smoothness_loss,
             knot_gradient=knot_gradient,
             field=field,
             statistics=statistics,
@@ -280,7 +293,7 @@ class BoundaryOptimizer:
             final_loss=float(self._weight_scale * evaluation.loss),
             uniformity_loss=float(evaluation.uniformity_loss),
             area_loss=float(evaluation.area_loss),
-            isoline_loss=float(evaluation.isoline_loss),
+            length_smoothness_loss=float(evaluation.length_smoothness_loss),
             history=history,
             parameter_history=parameter_history,
             parameters=final_parameters,

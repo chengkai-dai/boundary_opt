@@ -9,7 +9,7 @@ import numpy as np
 
 from boundary_opt import (
     DEFAULT_AREA_WEIGHT,
-    DEFAULT_ISOLINE_WEIGHT,
+    DEFAULT_LENGTH_SMOOTHNESS_WEIGHT,
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_MINIMUM_GAP,
     DEFAULT_UNIFORMITY_WEIGHT,
@@ -26,7 +26,9 @@ from boundary_opt.boundary import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--mesh", choices=("disk", "plane", "triple_peak"), default="disk"
+        "--mesh",
+        choices=("disk", "plane", "peak", "triple_peak"),
+        default="disk",
     )
     parser.add_argument("--backend", choices=("slsqp", "spg"), default="slsqp")
     parser.add_argument("--seed", type=int, default=0)
@@ -36,7 +38,11 @@ def parse_args() -> argparse.Namespace:
         "--uniformity-weight", type=float, default=DEFAULT_UNIFORMITY_WEIGHT
     )
     parser.add_argument("--area-weight", type=float, default=DEFAULT_AREA_WEIGHT)
-    parser.add_argument("--isoline-weight", type=float, default=DEFAULT_ISOLINE_WEIGHT)
+    parser.add_argument(
+        "--length-smoothness-weight",
+        type=float,
+        default=DEFAULT_LENGTH_SMOOTHNESS_WEIGHT,
+    )
     parser.add_argument(
         "--screenshot",
         type=Path,
@@ -344,7 +350,7 @@ def main() -> None:
         minimum_gap=args.minimum_gap,
         uniformity_weight=args.uniformity_weight,
         area_weight=args.area_weight,
-        isoline_weight=args.isoline_weight,
+        length_smoothness_weight=args.length_smoothness_weight,
     )
     initial_knots = random_knots(args.seed, args.minimum_gap)
     initial_boundary, _ = cyclic_boundary_profile(

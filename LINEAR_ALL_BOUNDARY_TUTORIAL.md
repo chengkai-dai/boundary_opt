@@ -60,7 +60,7 @@ flowchart LR
     G --> LG["gradient uniformity"]
     G --> I
     A --> LA["area balance"]
-    I --> LI["isoline-length differences"]
+    I --> LI["length smoothness loss"]
     LG --> L["weighted total loss"]
     LA --> L
     LI --> L
@@ -415,19 +415,25 @@ barycentric quadrature points：
 \delta_\sigma(u_{fq}-t_j).
 \]
 
-其中 \(c_j\) 修正靠近 0 和 1 时 Gaussian 被值域截断的质量。相邻长度差 loss 为
+其中 \(c_j\) 修正靠近 0 和 1 时 Gaussian 被值域截断的质量。相邻 course 长度的
+smoothness loss 为
 
 \[
-L_{\mathrm{isoline}}
+L_{\mathrm{smooth}}
 =\frac{
 \frac1{m-1}\sum_{j=1}^{m-1}
-[\hat\ell(t_{j+1})-\hat\ell(t_j)]^2
+\left[\frac{\hat\ell(t_{j+1})-\hat\ell(t_j)}
+{t_{j+1}-t_j}\right]^2
 }{\bar\ell^2+\varepsilon}.
 \]
 
+除以 level 间距后，它是归一化的离散 \(H^1\) seminorm，不会因为增加采样 levels
+就自动变小。它惩罚相邻 knitting courses 突然变长或缩短，但不要求所有 courses
+具有同一个绝对长度。
+
 这仍不需要显式提取 contour，但与 area CDF 不同，它通过 \(|\nabla u|\) 消掉了 coarea
 公式里的 reciprocal-gradient 因子，因此直接估计长度。实现位于
-[`isoline_length_loss_and_gradient`](boundary_opt/loss.py)。
+[`length_smoothness_loss_and_gradient`](boundary_opt/loss.py)。
 
 ### 7.4 Loss 自身不保证“从 0 到 1”
 
@@ -454,7 +460,7 @@ L_{\mathrm{isoline}}
 \[
 L=\lambda_{\mathrm{uniform}}L_{\mathrm{uniform}}
 +\lambda_{\mathrm{area}}L_{\mathrm{area}}
-+\lambda_{\mathrm{isoline}}L_{\mathrm{isoline}}.
++\lambda_{\mathrm{smooth}}L_{\mathrm{smooth}}.
 \]
 
 默认值统一位于 `defaults.py`。Area loss 保留，但默认权重为零。三个权重只有相对比例
@@ -532,8 +538,8 @@ S_{fj}=S\!\left(\frac{t_j-\bar u_f}{\sigma}\right),
 \frac{\partial L_{\mathrm{uniform}}}{\partial\boldsymbol u}
 +\lambda_{\mathrm{area}}
 \frac{\partial L_{\mathrm{area}}}{\partial\boldsymbol u}
-+\lambda_{\mathrm{isoline}}
-\frac{\partial L_{\mathrm{isoline}}}{\partial\boldsymbol u}.
++\lambda_{\mathrm{smooth}}
+\frac{\partial L_{\mathrm{smooth}}}{\partial\boldsymbol u}.
 \]
 
 ### 9.2 用一次 transpose solve 传回边界
@@ -959,11 +965,12 @@ L_{\mathrm{area}}=0.
 每条内部等值线都是等长直线，所以
 
 \[
-L_{\mathrm{isoline}}=0.
+L_{\mathrm{smooth}}=0.
 \]
 
-三个 loss 都非负，因此四角解是连续模型的 global optimum。离散 soft isoline loss 使用
-三点 triangle quadrature；当前 Plane 四角场上的 raw loss 约为 \(1.1\times10^{-11}\)。
+三个 loss 都非负，因此四角解是连续模型的 global optimum。离散 length smoothness loss
+使用三点 triangle quadrature；当前 Plane 四角场上的 raw loss 约为
+\(4.5\times10^{-9}\)。
 
 ![Plane 四角对应的 affine 零-loss 场](docs/figures/linear-plane-four-corners-polyscope.png)
 
@@ -1149,7 +1156,7 @@ g_i\ge\delta,
 L=\lambda_{\mathrm{uniform}}
 \operatorname{CV}_{A}^{2}(\lVert\nabla u\rVert^2)
 +\lambda_{\mathrm{area}}L_{\mathrm{area}}
-+\lambda_{\mathrm{isoline}}L_{\mathrm{isoline}}
++\lambda_{\mathrm{smooth}}L_{\mathrm{smooth}}
 }
 \]
 

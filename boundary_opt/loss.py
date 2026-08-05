@@ -12,6 +12,7 @@ FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int64]
 
 _FIELD_LEVELS = np.linspace(0.05, 0.95, 19)
+_FIELD_LEVEL_STEPS = np.diff(_FIELD_LEVELS)
 _AREA_SMOOTHING = 0.01
 _AREA_TARGET = _AREA_SMOOTHING * (
     np.logaddexp(0.0, _FIELD_LEVELS / _AREA_SMOOTHING)
@@ -106,13 +107,13 @@ def area_balance_loss_and_gradient(
     return loss, field_gradient
 
 
-def isoline_length_loss_and_gradient(
+def length_smoothness_loss_and_gradient(
     field: FloatArray,
     faces: IntArray,
     gradient_basis: FloatArray,
     face_weights: FloatArray,
 ) -> tuple[float, FloatArray]:
-    """Equalize differentiable coarea estimates of neighboring isoline lengths."""
+    """Penalize rapid changes between neighboring soft isoline lengths."""
     face_values = np.asarray(field, dtype=np.float64)[faces]
     gradients = np.einsum("fij,fi->fj", gradient_basis, face_values)
     gradient_norms = np.sqrt(np.einsum("ij,ij->i", gradients, gradients) + 1.0e-24)
@@ -127,14 +128,16 @@ def isoline_length_loss_and_gradient(
     mean_kernels = kernels.mean(axis=1)
     lengths = (face_weights * gradient_norms) @ mean_kernels
 
-    differences = np.diff(lengths)
-    numerator = float(np.mean(differences**2))
+    length_rates = np.diff(lengths) / _FIELD_LEVEL_STEPS
+    numerator = float(np.mean(length_rates**2))
     mean_length = float(lengths.mean())
     denominator = mean_length**2 + 1.0e-15
     loss = numerator / denominator
 
     length_gradient = np.zeros_like(lengths)
-    difference_gradient = 2.0 * differences / len(differences)
+    difference_gradient = (
+        2.0 * length_rates / _FIELD_LEVEL_STEPS / len(length_rates)
+    )
     length_gradient[:-1] -= difference_gradient
     length_gradient[1:] += difference_gradient
     length_gradient = (

@@ -11,7 +11,7 @@ import numpy as np
 
 from boundary_opt import (
     DEFAULT_AREA_WEIGHT,
-    DEFAULT_ISOLINE_WEIGHT,
+    DEFAULT_LENGTH_SMOOTHNESS_WEIGHT,
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_MINIMUM_GAP,
     DEFAULT_UNIFORMITY_WEIGHT,
@@ -24,7 +24,9 @@ from boundary_opt import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--mesh", choices=("disk", "plane", "triple_peak"), default="disk"
+        "--mesh",
+        choices=("disk", "plane", "peak", "triple_peak"),
+        default="disk",
     )
     parser.add_argument("--backend", choices=("slsqp", "spg"), default="slsqp")
     parser.add_argument("--seeds", type=int, default=16, help="scan seeds [0, N)")
@@ -34,7 +36,11 @@ def parse_args() -> argparse.Namespace:
         "--uniformity-weight", type=float, default=DEFAULT_UNIFORMITY_WEIGHT
     )
     parser.add_argument("--area-weight", type=float, default=DEFAULT_AREA_WEIGHT)
-    parser.add_argument("--isoline-weight", type=float, default=DEFAULT_ISOLINE_WEIGHT)
+    parser.add_argument(
+        "--length-smoothness-weight",
+        type=float,
+        default=DEFAULT_LENGTH_SMOOTHNESS_WEIGHT,
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--history-output", type=Path)
     return parser.parse_args()
@@ -51,7 +57,7 @@ def main() -> None:
         minimum_gap=args.minimum_gap,
         uniformity_weight=args.uniformity_weight,
         area_weight=args.area_weight,
-        isoline_weight=args.isoline_weight,
+        length_smoothness_weight=args.length_smoothness_weight,
     )
     setup_seconds = time.perf_counter() - start
     print(
@@ -84,12 +90,12 @@ def main() -> None:
             "minimum_gap": args.minimum_gap,
             "uniformity_weight": args.uniformity_weight,
             "area_weight": args.area_weight,
-            "isoline_weight": args.isoline_weight,
+            "length_smoothness_weight": args.length_smoothness_weight,
             "initial_loss": result.initial_loss,
             "final_loss": result.final_loss,
             "uniformity_loss": result.uniformity_loss,
             "area_loss": result.area_loss,
-            "isoline_loss": result.isoline_loss,
+            "length_smoothness_loss": result.length_smoothness_loss,
             "reduction": reduction,
             "iterations": result.iterations,
             "evaluations": result.evaluations,
@@ -127,7 +133,7 @@ def main() -> None:
             f"{result.initial_loss:.6f} -> {result.final_loss:.6f} "
             f"({100.0 * reduction:6.2f}%) uniform={result.uniformity_loss:.6f} "
             f"area={result.area_loss:.6f} "
-            f"isoline={result.isoline_loss:.6f} "
+            f"length_smoothness={result.length_smoothness_loss:.6f} "
             f"cv={result.statistics.spacing_cv:.4f} "
             f"iter={result.iterations:02d} kkt={result.kkt_residual:.2e} "
             f"time={optimize_seconds:.4f}s"

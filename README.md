@@ -83,7 +83,7 @@ The objective is
 ```text
 total = (uniformity_weight * uniformity_loss
          + area_weight * area_loss
-         + isoline_weight * isoline_loss)
+         + length_smoothness_weight * length_smoothness_loss)
 ```
 
 The corresponding constants in `defaults.py` supply the defaults. Area loss
@@ -150,5 +150,6 @@ coordinates, SLSQP, and SPG, see
 - A discretely constant field makes the scale-free CV loss undefined and raises
   `DegenerateFieldError`.
 - Area balance uses a smooth CDF sampled at 19 fixed field levels.
-- Soft isoline length uses Gaussian bands and three-point triangle quadrature;
+- Length smoothness uses Gaussian soft-isoline estimates and three-point triangle
+  quadrature;
   it is differentiable but still resolution- and bandwidth-dependent.
