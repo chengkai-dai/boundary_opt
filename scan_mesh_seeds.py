@@ -72,8 +72,11 @@ def main() -> None:
             "reduction": reduction,
             "iterations": result.iterations,
             "evaluations": result.evaluations,
+            "total_evaluations": result.total_evaluations,
             "success": int(result.success),
             "gradient_norm": result.gradient_norm,
+            "kkt_residual": result.kkt_residual,
+            "constraint_violation": result.constraint_violation,
             "optimize_seconds": optimize_seconds,
             "spacing_cv": result.statistics.spacing_cv,
             "minimum_gradient": result.statistics.minimum_gradient,
@@ -96,16 +99,17 @@ def main() -> None:
         history_rows.extend(
             {
                 "seed": seed,
-                "iteration": iteration,
+                "record": record,
                 "loss": float(loss),
             }
-            for iteration, loss in enumerate(result.history)
+            for record, loss in enumerate(result.history)
         )
         print(
             f"seed={seed:02d} loss {result.initial_loss:.6f} -> {result.final_loss:.6f} "
             f"({100.0 * reduction:6.2f}%) uniform={result.uniformity_loss:.6f} "
             f"width={result.width_loss:.6f} cv={result.statistics.spacing_cv:.4f} "
-            f"iter={result.iterations:02d} time={optimize_seconds:.4f}s "
+            f"iter={result.iterations:02d} kkt={result.kkt_residual:.2e} "
+            f"time={optimize_seconds:.4f}s "
             f"success={result.success}"
         )
 

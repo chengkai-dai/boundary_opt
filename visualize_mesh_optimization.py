@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--animate",
         action="store_true",
-        help="loop over accepted optimization iterations in the viewer",
+        help="loop over the feasible optimization record in the viewer",
     )
     parser.add_argument(
         "--final-only",
@@ -164,11 +164,15 @@ def register_animation_state(
 def optimization_frames(
     optimizer: HarmonicBoundaryOptimizer, parameter_history: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Evaluate harmonic fields and boundary colors along an accepted trajectory."""
+    """Evaluate fields and colors along the public feasible-state record."""
     fields = []
     colors = []
     for parameters in parameter_history:
-        knots, _, _ = knots_from_parameters(parameters, optimizer.minimum_gap)
+        knots, _, _ = knots_from_parameters(
+            parameters,
+            optimizer.minimum_gap,
+            enforce_minimum_gap=False,
+        )
         boundary_values, _ = cyclic_boundary_profile(
             optimizer.boundary_positions, knots
         )
@@ -264,7 +268,7 @@ def make_animation_callback(
     losses: np.ndarray,
     fps: float,
 ):
-    """Return an auto-looping accepted-iteration playback callback."""
+    """Return an auto-looping feasible-state playback callback."""
     hold = max(1, round(fps))
     sequence = np.concatenate(
         (
@@ -299,7 +303,7 @@ def make_animation_callback(
         draw_label(
             psim,
             0.75 * width,
-            f"ITERATION {state['frame']} / {len(fields) - 1}",
+            f"RECORD {state['frame']} / {len(fields) - 1}",
             f"loss = {losses[state['frame']]:.6f}",
             rgba8(5, 150, 105),
         )
@@ -397,7 +401,7 @@ def main() -> None:
         )
         print(
             f"seed={args.seed} loss {result.initial_loss:.6f} -> "
-            f"{result.final_loss:.6f}; playing {len(fields)} accepted states"
+            f"{result.final_loss:.6f}; playing {len(fields)} feasible states"
         )
         ps.show()
         return

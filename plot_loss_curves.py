@@ -1,4 +1,4 @@
-"""Plot one or more random-seed loss-history CSV files as SVG."""
+"""Plot one or more CSV or NPZ optimization histories as SVG."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from pathlib import Path
 from statistics import median
 from xml.sax.saxutils import escape
 
+import numpy as np
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -17,8 +19,8 @@ def parse_args() -> argparse.Namespace:
         "--history",
         nargs=2,
         action="append",
-        metavar=("LABEL", "CSV"),
-        help="repeat for each panel",
+        metavar=("LABEL", "FILE"),
+        help="repeat for each panel; input may be a history CSV or result NPZ",
     )
     parser.add_argument("--title", default="Harmonic boundary optimization")
     parser.add_argument("--svg", type=Path, default=Path("output/loss_curves.svg"))
@@ -27,11 +29,19 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_histories(path: Path) -> dict[int, list[float]]:
+    if path.suffix.lower() == ".npz":
+        with np.load(path) as result:
+            history = np.asarray(result["history"], dtype=np.float64)
+        if history.ndim != 1 or len(history) == 0:
+            raise ValueError("NPZ history must be a non-empty vector")
+        return {0: history.tolist()}
+
     histories: defaultdict[int, list[tuple[int, float]]] = defaultdict(list)
     with path.open(encoding="utf-8") as stream:
         for row in csv.DictReader(stream):
+            record_key = "record" if "record" in row else "iteration"
             histories[int(row["seed"])].append(
-                (int(row["iteration"]), float(row["loss"]))
+                (int(row[record_key]), float(row["loss"]))
             )
     return {
         seed: [value for _, value in sorted(points)]
@@ -53,10 +63,10 @@ def chart_svg(
     left, right, top, bottom, gap = 66, 24, 38, 58, 58
     panel_width = (width - left - right - gap * (len(panels) - 1)) / len(panels)
     plot_height = height - top - bottom
-    maximum_iteration = max(
+    maximum_record = max(
         len(history) - 1 for _, data in panels for history in data.values()
     )
-    maximum_iteration = max(10, int(math.ceil(maximum_iteration / 10.0) * 10))
+    maximum_record = max(10, int(math.ceil(maximum_record / 10.0) * 10))
     all_values = [
         value for _, data in panels for history in data.values() for value in history
     ]
@@ -76,7 +86,7 @@ def chart_svg(
     lower = max(value for value in candidate_ticks if value <= display_floor)
     upper = min(value for value in candidate_ticks if value >= display_ceiling)
     y_ticks = [value for value in candidate_ticks if lower <= value <= upper]
-    x_ticks = list(range(0, maximum_iteration + 1, 10))
+    x_ticks = list(range(0, maximum_record + 1, 10))
 
     colors = (
         {
@@ -96,11 +106,9 @@ def chart_svg(
         }
     )
 
-    def x_coordinate(iteration: int, panel: int) -> float:
+    def x_coordinate(record: int, panel: int) -> float:
         return (
-            left
-            + panel * (panel_width + gap)
-            + panel_width * iteration / maximum_iteration
+            left + panel * (panel_width + gap) + panel_width * record / maximum_record
         )
 
     def y_coordinate(value: float) -> float:
@@ -113,7 +121,7 @@ def chart_svg(
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}" style="width:100%;height:auto;display:block" role="img" aria-labelledby="loss-title loss-desc">',
         f'<title id="loss-title">{escape(title)} loss curves</title>',
-        '<desc id="loss-desc">Random-seed optimization histories; thin lines are runs and the thick line is the median. The vertical axis is logarithmic.</desc>',
+        '<desc id="loss-desc">Recorded optimization histories; thin lines are runs and the thick line is the pointwise median. Shorter histories hold their last value. The vertical axis is logarithmic.</desc>',
     ]
     if not themed:
         parts.append(f'<rect width="{width}" height="{height}" fill="#ffffff"/>')
@@ -140,23 +148,23 @@ def chart_svg(
 
         for history in histories.values():
             points = [
-                (x_coordinate(iteration, panel), y_coordinate(value))
-                for iteration, value in enumerate(history)
+                (x_coordinate(record, panel), y_coordinate(value))
+                for record, value in enumerate(history)
             ]
             parts.append(
                 f'<polyline points="{polyline(points)}" stroke="{colors["peer"]}" stroke-opacity="0.32" stroke-width="1.2"/>'
             )
 
+        panel_maximum_record = max(len(history) - 1 for history in histories.values())
         median_history = [
             median(
-                history[min(iteration, len(history) - 1)]
-                for history in histories.values()
+                history[min(record, len(history) - 1)] for history in histories.values()
             )
-            for iteration in range(maximum_iteration + 1)
+            for record in range(panel_maximum_record + 1)
         ]
         median_points = [
-            (x_coordinate(iteration, panel), y_coordinate(value))
-            for iteration, value in enumerate(median_history)
+            (x_coordinate(record, panel), y_coordinate(value))
+            for record, value in enumerate(median_history)
         ]
         parts.append(
             f'<polyline points="{polyline(median_points)}" stroke="{colors["median"]}" stroke-width="3"/>'
@@ -170,7 +178,7 @@ def chart_svg(
 
     parts.extend(
         (
-            f'<text x="{width / 2:.2f}" y="{height - 8}" text-anchor="middle" fill="{colors["text"]}" font-size="13">Accepted L-BFGS iteration</text>',
+            f'<text x="{width / 2:.2f}" y="{height - 8}" text-anchor="middle" fill="{colors["text"]}" font-size="13">History record</text>',
             f'<text x="16" y="{top + plot_height / 2:.2f}" text-anchor="middle" transform="rotate(-90 16 {top + plot_height / 2:.2f})" fill="{colors["text"]}" font-size="13">Total loss · log scale</text>',
             "</g></svg>",
         )

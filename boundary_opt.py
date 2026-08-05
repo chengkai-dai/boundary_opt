@@ -23,6 +23,11 @@ from numpy.typing import NDArray
 FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int64]
 
+_KNOT_PARAMETER_JACOBIAN = np.tril(np.ones((4, 4), dtype=np.float64))
+_SIMPLEX_SUM = np.asarray([0.0, 1.0, 1.0, 1.0])
+_FEASIBILITY_TOLERANCE = 1.0e-9
+_INFEASIBLE_PENALTY = 1.0e6
+
 
 @dataclass(frozen=True, slots=True)
 class Mesh:
@@ -65,9 +70,22 @@ class OptimizationResult:
     statistics: FieldStatistics
     iterations: int
     evaluations: int
+    total_evaluations: int
     gradient_norm: float
+    kkt_residual: float
+    constraint_violation: float
     success: bool
     message: str
+
+
+@dataclass(slots=True)
+class _LocalRun:
+    result: scipy.optimize.OptimizeResult
+    history: list[float]
+    parameter_history: list[FloatArray]
+    evaluations: int
+    best_parameters: FloatArray
+    best_loss: float
 
 
 def load_obj(path: str | Path) -> Mesh:
@@ -192,43 +210,38 @@ def cyclic_boundary_profile(
 
 
 def knots_from_parameters(
-    parameters: FloatArray, minimum_gap: float
+    parameters: FloatArray,
+    minimum_gap: float,
+    *,
+    enforce_minimum_gap: bool = True,
 ) -> tuple[FloatArray, FloatArray, FloatArray]:
-    """Map one origin and three gauge-fixed logits to four ordered knots."""
+    """Map ``(offset, g0, g1, g2)`` from the closed simplex to knots."""
     parameters = np.asarray(parameters, dtype=np.float64).reshape(-1)
     if parameters.shape != (4,) or not np.isfinite(parameters).all():
         raise ValueError("parameters must contain four finite values")
     if not np.isfinite(minimum_gap) or not 0.0 <= minimum_gap < 0.25:
         raise ValueError("minimum_gap must lie in [0, 0.25)")
 
-    logits = np.concatenate((parameters[1:], [0.0]))
-    exponentials = np.exp(logits - logits.max())
-    probabilities = exponentials / exponentials.sum()
-    scale = 1.0 - 4.0 * minimum_gap
-    gaps = minimum_gap + scale * probabilities
+    gaps = np.append(parameters[1:], 1.0 - parameters[1:].sum())
+    if np.any(gaps <= 0.0):
+        raise ValueError("all cyclic knot gaps must be positive")
+    if enforce_minimum_gap and np.any(gaps < minimum_gap - _FEASIBILITY_TOLERANCE):
+        raise ValueError("parameters lie outside the minimum-gap simplex")
     knots = parameters[0] + np.concatenate(([0.0], np.cumsum(gaps[:3])))
-
-    softmax_jacobian = np.diag(probabilities) - np.outer(probabilities, probabilities)
-    gap_jacobian = scale * softmax_jacobian[:, :3]
-    jacobian = np.zeros((4, 4), dtype=np.float64)
-    jacobian[:, 0] = 1.0
-    for index in range(1, 4):
-        jacobian[index, 1:] = gap_jacobian[:index].sum(axis=0)
-    return knots, jacobian, gaps
+    return knots, _KNOT_PARAMETER_JACOBIAN.copy(), gaps
 
 
 def parameters_from_knots(knots: FloatArray, minimum_gap: float) -> FloatArray:
-    """Invert :func:`knots_from_parameters` after fixing the softmax gauge."""
+    """Return direct closed-simplex coordinates for ordered cyclic knots."""
     knots = np.asarray(knots, dtype=np.float64).reshape(-1)
     if knots.shape != (4,) or not np.isfinite(knots).all():
         raise ValueError("knots must contain four finite values")
     if not np.isfinite(minimum_gap) or not 0.0 <= minimum_gap < 0.25:
         raise ValueError("minimum_gap must lie in [0, 0.25)")
     gaps = np.append(np.diff(knots), knots[0] + 1.0 - knots[3])
-    probabilities = (gaps - minimum_gap) / (1.0 - 4.0 * minimum_gap)
-    if np.any(probabilities <= 0.0):
-        raise ValueError("each cyclic knot gap must exceed minimum_gap")
-    return np.concatenate(([knots[0]], np.log(probabilities[:3] / probabilities[3])))
+    if np.any(gaps <= 0.0) or np.any(gaps < minimum_gap - _FEASIBILITY_TOLERANCE):
+        raise ValueError("each cyclic knot gap must be at least minimum_gap")
+    return np.concatenate(([knots[0] % 1.0], gaps[:3]))
 
 
 def random_knots(seed: int, minimum_gap: float = 0.03) -> FloatArray:
@@ -241,6 +254,29 @@ def random_knots(seed: int, minimum_gap: float = 0.03) -> FloatArray:
     gaps = minimum_gap + (1.0 - 4.0 * minimum_gap) * rng.dirichlet(np.ones(4))
     origin = float(rng.uniform())
     return origin + np.concatenate(([0.0], np.cumsum(gaps[:3])))
+
+
+def _project_explicit_gaps(gaps: FloatArray, minimum_gap: float) -> FloatArray:
+    """Project three explicit gaps onto their shifted closed simplex."""
+    shifted = np.asarray(gaps, dtype=np.float64) - minimum_gap
+    capacity = 1.0 - 4.0 * minimum_gap
+    positive = np.maximum(shifted, 0.0)
+    if positive.sum() <= capacity:
+        return minimum_gap + positive
+
+    ordered = np.sort(shifted)[::-1]
+    thresholds = (np.cumsum(ordered) - capacity) / np.arange(1.0, 4.0)
+    active = np.flatnonzero(ordered > thresholds)
+    threshold = thresholds[active[-1]]
+    return minimum_gap + np.maximum(shifted - threshold, 0.0)
+
+
+def _kkt_residual(
+    parameters: FloatArray, gradient: FloatArray, minimum_gap: float
+) -> float:
+    projected = _project_explicit_gaps(parameters[1:] - gradient[1:], minimum_gap)
+    gap_residual = parameters[1:] - projected
+    return float(np.linalg.norm(np.concatenate(([gradient[0]], gap_residual))))
 
 
 def cotangent_stiffness(mesh: Mesh) -> scipy.sparse.csr_matrix:
@@ -443,9 +479,14 @@ class HarmonicBoundaryOptimizer:
         )
         return loss, gap_jacobian.T @ gap_gradient
 
-    def loss_and_gradient(self, parameters: FloatArray) -> tuple[float, FloatArray]:
-        """Return the scale-invariant field loss and exact four-vector gradient."""
-        knots, knot_jacobian, gaps = knots_from_parameters(parameters, self.minimum_gap)
+    def _loss_and_gradient(
+        self, parameters: FloatArray, *, enforce_minimum_gap: bool
+    ) -> tuple[float, FloatArray]:
+        knots, knot_jacobian, gaps = knots_from_parameters(
+            parameters,
+            self.minimum_gap,
+            enforce_minimum_gap=enforce_minimum_gap,
+        )
         boundary_values, profile_jacobian = cyclic_boundary_profile(
             self.boundary_positions, knots
         )
@@ -459,6 +500,10 @@ class HarmonicBoundaryOptimizer:
             knot_jacobian.T @ knot_gradient + width_gradient,
         )
 
+    def loss_and_gradient(self, parameters: FloatArray) -> tuple[float, FloatArray]:
+        """Return the loss and exact gradient in direct simplex coordinates."""
+        return self._loss_and_gradient(parameters, enforce_minimum_gap=True)
+
     def optimize(
         self,
         initial_knots: FloatArray,
@@ -466,42 +511,213 @@ class HarmonicBoundaryOptimizer:
         max_iterations: int = 60,
         seed: int | None = None,
     ) -> OptimizationResult:
-        """Run L-BFGS from one ordered cyclic four-knot initialization."""
+        """Run exact-gradient SLSQP on the closed minimum-gap simplex."""
         if not isinstance(max_iterations, int) or isinstance(max_iterations, bool):
             raise TypeError("max_iterations must be an integer")
         if max_iterations < 1:
             raise ValueError("max_iterations must be positive")
-        initial_parameters = parameters_from_knots(initial_knots, self.minimum_gap)
-        initial_loss, _ = self.loss_and_gradient(initial_parameters)
-        history = [float(initial_loss)]
-        parameter_history = [initial_parameters.copy()]
+        initial_knots = np.asarray(initial_knots, dtype=np.float64).reshape(-1)
 
-        def callback(intermediate_result: scipy.optimize.OptimizeResult) -> None:
-            parameter_history.append(
-                np.asarray(intermediate_result.x, dtype=np.float64).copy()
-            )
-            history.append(float(intermediate_result.fun))
+        def canonical_start(values: FloatArray) -> FloatArray:
+            canonical = np.round(np.asarray(values, dtype=np.float64), decimals=14)
+            canonical[0] %= 1.0
+            canonical[1:] = _project_explicit_gaps(canonical[1:], self.minimum_gap)
+            return canonical
 
-        result = scipy.optimize.minimize(
-            self.loss_and_gradient,
-            initial_parameters,
-            jac=True,
-            method="L-BFGS-B",
-            callback=callback,
-            options={
-                "maxiter": max_iterations,
-                "ftol": 1.0e-12,
-                "gtol": 1.0e-8,
-                "maxls": 30,
-            },
+        initial_parameters = canonical_start(
+            parameters_from_knots(initial_knots, self.minimum_gap)
+        )
+        complement_knots = np.concatenate((initial_knots[2:], initial_knots[:2] + 1.0))
+        complement_parameters = canonical_start(
+            parameters_from_knots(complement_knots, self.minimum_gap)
+        )
+        start_specs = [
+            (initial_parameters, False),
+            (complement_parameters, True),
+        ]
+        start_specs.sort(key=lambda item: tuple(item[0]))
+        constraint = scipy.optimize.LinearConstraint(
+            _SIMPLEX_SUM, -np.inf, 1.0 - self.minimum_gap
+        )
+        bounds = (
+            (None, None),
+            (self.minimum_gap, None),
+            (self.minimum_gap, None),
+            (self.minimum_gap, None),
         )
 
-        parameters = np.asarray(result.x, dtype=np.float64)
-        knots, knot_jacobian, gaps = knots_from_parameters(parameters, self.minimum_gap)
-        boundary_values, _ = cyclic_boundary_profile(self.boundary_positions, knots)
+        def feasible(values: FloatArray) -> bool:
+            try:
+                _, _, candidate_gaps = knots_from_parameters(
+                    values,
+                    self.minimum_gap,
+                    enforce_minimum_gap=False,
+                )
+            except ValueError:
+                return False
+            return bool(
+                np.all(candidate_gaps >= self.minimum_gap - _FEASIBILITY_TOLERANCE)
+            )
+
+        def local_optimize(start: FloatArray) -> _LocalRun:
+            evaluated: dict[bytes, tuple[float, bool]] = {}
+            objective_calls = 0
+            best_parameters: FloatArray | None = None
+            best_loss = np.inf
+            recovery_target = np.asarray([0.0, 0.25, 0.25, 0.25])
+
+            def objective(values: FloatArray) -> tuple[float, FloatArray]:
+                nonlocal best_loss, best_parameters, objective_calls
+                objective_calls += 1
+                values = np.asarray(values, dtype=np.float64)
+                implicit_gap = 1.0 - float(values[1:].sum())
+                valid_field = False
+                if implicit_gap <= 0.0:
+                    shortfall = self.minimum_gap - implicit_gap
+                    loss = _INFEASIBLE_PENALTY * (1.0 + shortfall**2)
+                    gradient = np.zeros(4, dtype=np.float64)
+                    gradient[1:] = 2.0 * _INFEASIBLE_PENALTY * shortfall
+                else:
+                    try:
+                        loss, gradient = self._loss_and_gradient(
+                            values, enforce_minimum_gap=False
+                        )
+                        valid_field = True
+                    except ValueError as error:
+                        if str(error) != (
+                            "harmonic field has zero or invalid gradient energy"
+                        ):
+                            raise
+                        recovery_error = values - recovery_target
+                        recovery_error[0] = (recovery_error[0] + 0.5) % 1.0 - 0.5
+                        loss = _INFEASIBLE_PENALTY * (
+                            1.0 + float(recovery_error @ recovery_error)
+                        )
+                        gradient = 2.0 * _INFEASIBLE_PENALTY * recovery_error
+                key = values.tobytes()
+                evaluated[key] = (float(loss), valid_field)
+                if valid_field and feasible(values) and loss < best_loss:
+                    best_parameters = values.copy()
+                    best_loss = float(loss)
+                return loss, gradient
+
+            initial_loss, _ = objective(start)
+            local_history = [float(initial_loss)]
+            local_parameters = [start.copy()]
+            if best_parameters is None:
+                objective(recovery_target)
+
+            def callback(values: FloatArray) -> None:
+                values = np.asarray(values, dtype=np.float64)
+                if not feasible(values):
+                    return
+                record = evaluated.get(values.tobytes())
+                if record is None:
+                    objective(values)
+                    record = evaluated[values.tobytes()]
+                loss, valid_field = record
+                if not valid_field:
+                    return
+                local_parameters.append(values.copy())
+                local_history.append(float(loss))
+
+            result = scipy.optimize.minimize(
+                objective,
+                start,
+                jac=True,
+                method="SLSQP",
+                bounds=bounds,
+                constraints=constraint,
+                callback=callback,
+                options={
+                    "maxiter": max_iterations,
+                    "ftol": 1.0e-12,
+                    "disp": False,
+                },
+            )
+            if best_parameters is None:
+                raise RuntimeError("optimizer found no feasible nonconstant field")
+            return _LocalRun(
+                result=result,
+                history=local_history,
+                parameter_history=local_parameters,
+                evaluations=objective_calls,
+                best_parameters=best_parameters,
+                best_loss=best_loss,
+            )
+
+        runs = [local_optimize(parameters) for parameters, _ in start_specs]
+
+        def restore_complement(values: FloatArray) -> FloatArray:
+            run_knots, _, _ = knots_from_parameters(
+                values,
+                self.minimum_gap,
+                enforce_minimum_gap=False,
+            )
+            restored_knots = np.concatenate((run_knots[2:], run_knots[:2] + 1.0)) - 1.0
+            return np.concatenate(([restored_knots[0] % 1.0], np.diff(restored_knots)))
+
+        def run_candidate(run: _LocalRun) -> tuple[FloatArray, float, bool]:
+            parameters = run.best_parameters.copy()
+            return (
+                parameters,
+                run.best_loss,
+                bool(np.array_equal(parameters, run.result.x)),
+            )
+
+        def run_score(run: _LocalRun) -> float:
+            return run.best_loss
+
+        selected = min(range(len(runs)), key=lambda index: run_score(runs[index]))
+        selected_run = runs[selected]
+        result = selected_run.result
+        history = selected_run.history
+        parameter_history = selected_run.parameter_history
+        evaluations = selected_run.evaluations
+        candidate, candidate_loss, used_solver_result = run_candidate(runs[selected])
+        original_run = next(
+            index
+            for index, (_, is_complement) in enumerate(start_specs)
+            if not is_complement
+        )
+        original_initial_loss = float(runs[original_run].history[0])
+
+        if start_specs[selected][1]:
+            parameter_history = [
+                restore_complement(values) for values in parameter_history
+            ]
+            parameters = restore_complement(candidate)
+        else:
+            parameter_history = [values.copy() for values in parameter_history]
+            parameters = candidate.copy()
+
+        for values in parameter_history:
+            values[0] %= 1.0
+        parameters[0] %= 1.0
+
+        improvement_tolerance = 1.0e-12 * max(1.0, abs(original_initial_loss))
+        if candidate_loss >= original_initial_loss - improvement_tolerance:
+            parameters = initial_parameters.copy()
+            used_solver_result = False
+
+        parameter_history[0] = initial_parameters.copy()
+        history[0] = original_initial_loss
+        knots, knot_jacobian, gaps = knots_from_parameters(
+            parameters,
+            self.minimum_gap,
+            enforce_minimum_gap=False,
+        )
+        boundary_values, profile_jacobian = cyclic_boundary_profile(
+            self.boundary_positions, knots
+        )
         field = self.extend(boundary_values)
-        uniformity_loss, _, statistics = self._loss_and_field_gradient(field)
-        width_loss, _ = self._width_loss_and_gradient(gaps, knot_jacobian)
+        uniformity_loss, field_sensitivity, statistics = self._loss_and_field_gradient(
+            field
+        )
+        boundary_sensitivity = self.extend_adjoint(field_sensitivity)
+        knot_gradient = profile_jacobian.T @ boundary_sensitivity
+        width_loss, width_gradient = self._width_loss_and_gradient(gaps, knot_jacobian)
+        final_gradient = knot_jacobian.T @ knot_gradient + width_gradient
         final_loss = uniformity_loss + width_loss
         if np.array_equal(parameter_history[-1], parameters):
             history[-1] = float(final_loss)
@@ -510,7 +726,7 @@ class HarmonicBoundaryOptimizer:
             history.append(float(final_loss))
         return OptimizationResult(
             seed=seed,
-            initial_loss=float(initial_loss),
+            initial_loss=original_initial_loss,
             final_loss=float(final_loss),
             uniformity_loss=float(uniformity_loss),
             width_loss=float(width_loss),
@@ -522,8 +738,19 @@ class HarmonicBoundaryOptimizer:
             field=field,
             statistics=statistics,
             iterations=int(result.nit),
-            evaluations=int(result.nfev),
-            gradient_norm=float(np.linalg.norm(result.jac)),
-            success=bool(result.success),
-            message=str(result.message),
+            evaluations=evaluations,
+            total_evaluations=sum(run.evaluations for run in runs),
+            gradient_norm=float(np.linalg.norm(final_gradient)),
+            kkt_residual=_kkt_residual(parameters, final_gradient, self.minimum_gap),
+            constraint_violation=max(self.minimum_gap - float(gaps.min()), 0.0),
+            success=bool(result.success)
+            and np.all(gaps >= self.minimum_gap - _FEASIBILITY_TOLERANCE),
+            message=(
+                f"{result.message}; selected simplex chart {selected + 1}/2"
+                + (
+                    "; returned best feasible evaluation"
+                    if not used_solver_result
+                    else ""
+                )
+            ),
         )
