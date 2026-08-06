@@ -342,15 +342,17 @@ class BoundaryOptimizer:
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         seed: int | None = None,
     ) -> OptimizationResult:
-        """Return the best of the input and two balanced physical starts."""
-        initial_parameters = parameters_from_knots(initial_knots, self.minimum_gap)
-        balanced = np.concatenate(([initial_parameters[0]], np.full(4, 0.25)))
-        shifted = balanced.copy()
-        shifted[0] += 0.25
+        """Return the best local solution after a balanced phase sweep."""
+        phase_starts = [
+            knots_from_parameters(
+                np.concatenate(([phase], np.full(4, 0.25))), self.minimum_gap
+            )[0]
+            for phase in np.arange(16) / 16.0
+        ]
+        phase_starts.sort(key=lambda knots: self.loss_and_knot_gradient(knots)[0])
         starts = [
             np.asarray(initial_knots, dtype=np.float64).copy(),
-            knots_from_parameters(balanced, self.minimum_gap)[0],
-            knots_from_parameters(shifted, self.minimum_gap)[0],
+            *phase_starts[:4],
         ]
         runs = [
             self.optimize(
@@ -365,5 +367,5 @@ class BoundaryOptimizer:
         return replace(
             best,
             iterations=sum(run.iterations for run in runs),
-            evaluations=sum(run.evaluations for run in runs),
+            evaluations=len(phase_starts) + sum(run.evaluations for run in runs),
         )

@@ -24,7 +24,7 @@ def run_pipeline(
     mesh: Mesh,
     *,
     seed: int = 0,
-    backend: BackendName = "spg",
+    backend: BackendName = "slsqp",
     max_iterations: int = 500,
     config: PeelingConfig = PeelingConfig(),
     progress: Callable[[int], None] | None = None,

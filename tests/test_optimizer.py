@@ -292,7 +292,7 @@ def test_degenerate_initial_field_raises(backend: str) -> None:
     [
         ("disk.obj", 0.03),
         ("peak.obj", 0.03),
-        ("triple_peak.obj", 0.36),
+        ("triple_peak.obj", 0.351),
     ],
 )
 @pytest.mark.parametrize("backend", ["slsqp", "spg"])
