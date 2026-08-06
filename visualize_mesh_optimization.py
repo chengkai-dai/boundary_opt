@@ -13,13 +13,13 @@ from boundary_opt import (
     DEFAULT_MINIMUM_GAP,
     DEFAULT_UNIFORMITY_WEIGHT,
     BoundaryOptimizer,
-    load_obj,
     random_knots,
 )
 from boundary_opt.boundary import (
     cyclic_boundary_profile,
     knots_from_parameters,
 )
+from geometry import load_obj
 
 
 def parse_args() -> argparse.Namespace:
@@ -350,16 +350,19 @@ def main() -> None:
         length_smoothness_weight=args.length_smoothness_weight,
     )
     initial_knots = random_knots(args.seed, args.minimum_gap)
-    initial_boundary, _ = cyclic_boundary_profile(
-        optimizer.boundary_positions, initial_knots
-    )
-    initial_field = optimizer.harmonic.solve(initial_boundary)
-    result = optimizer.optimize(
+    result = optimizer.optimize_multistart(
         initial_knots,
         backend=args.backend,
         max_iterations=args.iterations,
         seed=args.seed,
     )
+    selected_initial_knots, _, _ = knots_from_parameters(
+        result.parameter_history[0], optimizer.minimum_gap
+    )
+    initial_boundary, _ = cyclic_boundary_profile(
+        optimizer.boundary_positions, selected_initial_knots
+    )
+    initial_field = optimizer.harmonic.solve(initial_boundary)
 
     display_vertices = principal_axis_view(mesh.vertices)
     extent = float(np.ptp(display_vertices[:, [0, 2]], axis=0).max())
@@ -388,7 +391,7 @@ def main() -> None:
             ps,
             optimizer,
             display_vertices,
-            f"initial · seed {args.seed}",
+            f"selected start · seed {args.seed}",
             fields[0],
             colors[0],
             np.zeros(3),
@@ -397,7 +400,7 @@ def main() -> None:
             ps,
             optimizer,
             display_vertices,
-            f"{args.backend} trajectory",
+            f"selected {args.backend} trajectory",
             fields[0],
             colors[0],
             translation,
@@ -458,7 +461,7 @@ def main() -> None:
         ps,
         optimizer,
         display_vertices,
-        f"before · seed {args.seed}",
+        f"selected start · seed {args.seed}",
         initial_field,
         initial_boundary,
         np.zeros(3),

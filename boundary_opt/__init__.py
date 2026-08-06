@@ -8,7 +8,6 @@ from .defaults import (
     DEFAULT_UNIFORMITY_WEIGHT,
 )
 from .harmonic import HarmonicField
-from .mesh import Mesh, load_obj
 from .optimizer import (
     BackendName,
     BoundaryOptimizer,
@@ -23,8 +22,6 @@ __all__ = [
     "BackendName",
     "BoundaryOptimizer",
     "HarmonicField",
-    "Mesh",
     "OptimizationResult",
-    "load_obj",
     "random_knots",
 ]

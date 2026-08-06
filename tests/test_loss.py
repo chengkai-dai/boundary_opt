@@ -3,9 +3,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from boundary_opt import load_obj
+from boundary_opt.fem import face_gradient_basis
 from boundary_opt.loss import length_smoothness_loss_and_gradient
-from boundary_opt.mesh import face_gradient_basis
+from geometry import load_obj
 
 ROOT = Path(__file__).resolve().parent.parent
 

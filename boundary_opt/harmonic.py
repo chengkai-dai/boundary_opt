@@ -5,13 +5,18 @@ from __future__ import annotations
 import numpy as np
 import scipy.sparse.linalg
 
-from .mesh import FloatArray, Mesh, boundary_loop, cotangent_stiffness
+from geometry import Mesh, boundary_loop
+from geometry.mesh import FloatArray
+
+from .fem import cotangent_stiffness
 
 
 class HarmonicField:
     """Prefactorized harmonic solve and its adjoint."""
 
     def __init__(self, mesh: Mesh) -> None:
+        if len(mesh.faces) == 0:
+            raise ValueError("harmonic mesh must contain faces")
         self.mesh = mesh
         self.boundary_vertices = boundary_loop(mesh.faces)
         interior = np.ones(len(mesh.vertices), dtype=bool)

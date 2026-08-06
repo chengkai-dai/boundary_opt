@@ -90,10 +90,11 @@ harmonic 方程一次性确定。
 这里的 \(\phi\) 不是三维空间中的极角，只是归一化边界弧长。换句话说，Disk、Plane
 或弯曲曲面都被统一摊成一条首尾相接的周期坐标轴。
 
-对应实现位于 [`boundary_opt/mesh.py`](boundary_opt/mesh.py)：
+对应实现分开放置：
 
-- `boundary_loop` 找出并排序边界环；
-- `boundary_arclength` 用三维边长计算归一化累计弧长。
+- [`geometry/mesh.py`](geometry/mesh.py) 中的 `boundary_loop` 找出并排序边界环；
+- [`boundary_opt/boundary.py`](boundary_opt/boundary.py) 中的 `boundary_arclength`
+  用三维边长计算归一化累计弧长。
 
 ---
 
@@ -248,7 +249,7 @@ objective evaluation 只更新右端项并回代，不会重新 factorize。
 
 相关实现：
 
-- [`boundary_opt/mesh.py`](boundary_opt/mesh.py) 中的 `cotangent_stiffness` 与
+- [`boundary_opt/fem.py`](boundary_opt/fem.py) 中的 `cotangent_stiffness` 与
   `face_gradient_basis`；
 - [`boundary_opt/harmonic.py`](boundary_opt/harmonic.py) 中的 `HarmonicField.solve`。
 
@@ -635,7 +636,8 @@ a_i=\widetilde g_i-\delta,
 公共入口是：
 
 ```python
-from boundary_opt import BoundaryOptimizer, load_obj, random_knots
+from boundary_opt import BoundaryOptimizer, random_knots
+from geometry import load_obj
 
 mesh = load_obj("data/disk.obj")
 optimizer = BoundaryOptimizer(mesh)
@@ -903,7 +905,7 @@ L_{\mathrm{smooth}}=0.
 应至少做三类检查：
 
 1. 直接把理论四角 knots 输入 `loss_and_knot_gradient`，验证 uniformity loss 接近零、
-   area loss 接近 quadrature 精度；
+   length smoothness loss 接近 quadrature 精度；
 2. 从四角附近扰动初值，验证两个 backend 能回到该 basin；
 3. 扫描随机 seeds，区分“理论解不存在”“离散实现错误”和“局部优化没有进入正确 basin”。
 
@@ -953,12 +955,13 @@ simplex projection 在 active set 改变时也不是处处光滑；SPG 只需要
 
 | 文件 | 职责 |
 |---|---|
+| [`geometry/mesh.py`](geometry/mesh.py) | 共享 Mesh、OBJ I/O、尺度归一化与边界环 |
 | [`boundary_opt/defaults.py`](boundary_opt/defaults.py) | 所有 public 默认参数的唯一来源 |
-| [`boundary_opt/mesh.py`](boundary_opt/mesh.py) | OBJ、边界拓扑、弧长、cotangent FEM 几何 |
+| [`boundary_opt/fem.py`](boundary_opt/fem.py) | cotangent stiffness 与三角形面梯度 |
 | [`boundary_opt/harmonic.py`](boundary_opt/harmonic.py) | harmonic 预分解、正向求解与 adjoint |
-| [`boundary_opt/boundary.py`](boundary_opt/boundary.py) | knots、gaps、profile 与 center/full-gap 转换 |
+| [`boundary_opt/boundary.py`](boundary_opt/boundary.py) | 边界弧长、knots、gaps、profile 与 center/full-gap 转换 |
 | [`boundary_opt/simplex.py`](boundary_opt/simplex.py) | closed simplex、projection 与 KKT residual |
-| [`boundary_opt/loss.py`](boundary_opt/loss.py) | gradient、area、soft isoline-length 与场统计 |
+| [`boundary_opt/loss.py`](boundary_opt/loss.py) | gradient uniformity、soft isoline-length smoothness 与场统计 |
 | [`boundary_opt/optimizer.py`](boundary_opt/optimizer.py) | objective、evaluation cache、结果与 backend dispatch |
 | [`boundary_opt/slsqp_backend.py`](boundary_opt/slsqp_backend.py) | exact-gradient constrained SLSQP |
 | [`boundary_opt/spg_backend.py`](boundary_opt/spg_backend.py) | BB1 SPG 与 nonmonotone Armijo |

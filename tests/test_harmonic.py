@@ -3,7 +3,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from boundary_opt import HarmonicField, load_obj
+from boundary_opt import HarmonicField
+from geometry import load_obj
 
 ROOT = Path(__file__).resolve().parent.parent
 

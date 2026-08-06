@@ -24,6 +24,16 @@ _CENTER_GAP_TO_KNOTS = np.asarray(
 )
 
 
+def boundary_arclength(vertices: FloatArray, loop: NDArray[np.int64]) -> FloatArray:
+    """Normalized cumulative arc length at ordered boundary vertices."""
+    following = np.roll(loop, -1)
+    lengths = np.linalg.norm(vertices[following] - vertices[loop], axis=1)
+    perimeter = float(lengths.sum())
+    if not np.isfinite(perimeter) or perimeter <= 0.0 or np.any(lengths <= 0.0):
+        raise ValueError("boundary loop contains a zero or invalid edge")
+    return np.concatenate(([0.0], np.cumsum(lengths[:-1]))) / perimeter
+
+
 def cyclic_boundary_profile(
     positions: FloatArray, knots: FloatArray
 ) -> tuple[FloatArray, FloatArray]:

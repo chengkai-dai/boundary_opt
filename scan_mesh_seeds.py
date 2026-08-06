@@ -15,9 +15,9 @@ from boundary_opt import (
     DEFAULT_MINIMUM_GAP,
     DEFAULT_UNIFORMITY_WEIGHT,
     BoundaryOptimizer,
-    load_obj,
     random_knots,
 )
+from geometry import load_obj
 
 
 def parse_args() -> argparse.Namespace:

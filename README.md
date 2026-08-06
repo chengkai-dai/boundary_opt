@@ -1,8 +1,8 @@
-# Harmonic boundary optimization
+# Harmonic boundary optimization and front peeling
 
-Clean four-knot optimization for a connected triangle mesh with one manifold
-boundary loop. The standalone package depends only on NumPy and SciPy and
-contains only the complete full-boundary model described below.
+Clean four-knot optimization and front peeling for a connected triangle mesh
+with one manifold boundary loop. The project is self-contained: it uses NumPy
+and SciPy for computation and Polyscope for the optional interactive viewer.
 
 The four ordered cyclic knots define a complete Dirichlet trace:
 
@@ -19,17 +19,28 @@ and one adjoint solve provide the exact gradient for each evaluation.
 ## Architecture
 
 ```text
+geometry/
+  mesh.py             shared mesh type, OBJ I/O, normalization, boundary loop
 boundary_opt/
-  defaults.py         shared public defaults
-  mesh.py             mesh I/O, boundary topology, cotangent FEM geometry
+  defaults.py         boundary-optimization defaults
+  fem.py              cotangent stiffness and face gradients
   harmonic.py         prefactorized harmonic solve and adjoint
-  boundary.py         knots, gaps, boundary profile, coordinate conversion
+  boundary.py         knots, gaps, arclength profile, coordinate conversion
   simplex.py          feasibility, projection, projected-gradient residual
   loss.py             gradient uniformity and length-smoothness losses
   slsqp_backend.py    one constrained SciPy SLSQP solve
   spg_backend.py      spectral projected gradient + nonmonotone Armijo
   optimizer.py        objective assembly, evaluation cache, backend dispatch
   __init__.py         public API only
+knitting/
+  graph.py            immutable public graph and mutable construction graph
+  front.py            initial boundary-course sampling
+  peeling.py          public peeling API and result
+  tracing.py          graph tracing
+  _peeling/           private trim, contour, linking, and planning core
+workflow.py           optimize → sample initial course → peel
+visualize_pipeline.py Polyscope adapter for workflow results
+pipeline.py           thin command-line entry point
 ```
 
 The filenames follow the mathematical roles instead of collecting unrelated
@@ -59,15 +70,16 @@ search therefore remains feasible throughout.
 ## High-level API
 
 ```python
-from boundary_opt import BoundaryOptimizer, load_obj, random_knots
+from boundary_opt import BoundaryOptimizer, random_knots
+from geometry import load_obj
 
 optimizer = BoundaryOptimizer(load_obj("data/disk.obj"))
 initial = random_knots(seed=0)
 
-slsqp = optimizer.optimize(initial, backend="slsqp", max_iterations=240)
-spg = optimizer.optimize(initial, backend="spg", max_iterations=240)
+slsqp = optimizer.optimize_multistart(initial, backend="slsqp", max_iterations=240)
+spg = optimizer.optimize_multistart(initial, backend="spg", max_iterations=240)
 
-# Or run both from exactly the same physical initial knots.
+# Or compare both local backends from exactly the same physical initial knots.
 results = optimizer.optimize_backends(initial, max_iterations=240)
 best = min(results.values(), key=lambda result: result.final_loss)
 ```
@@ -77,6 +89,17 @@ best = min(results.values(), key=lambda result: result.final_loss)
 ```python
 result = optimizer.optimize(initial)
 ```
+
+`optimize` is one local solve. `optimize_multistart` also tries equal-gap
+profiles at the input center phase and one quarter-turn away, then returns the
+lowest-loss run. Its iteration and evaluation counts include all three runs;
+its history is the selected run's real, uninterrupted trajectory.
+`max_iterations` applies to each run, and a failed run is reported rather than
+silently discarded.
+
+`scan_mesh_seeds.py` deliberately calls the single-start `optimize` method so
+that it measures local basins rather than nesting one multi-start search inside
+another.
 
 The objective is
 
@@ -98,7 +121,7 @@ four-entry reduced chart. Calls to `parameters_from_knots`,
 `knots_from_parameters`, or `loss_and_gradient` must now use the five stored
 coordinates `(center, g0, g1, g2, g3)`. The high-level four-knot `optimize`
 call is unchanged. Low-level helpers live in `boundary_opt.boundary`,
-`boundary_opt.simplex`, `boundary_opt.loss`, and `boundary_opt.mesh`; the
+`boundary_opt.simplex`, `boundary_opt.loss`, and `boundary_opt.fem`; the
 package root exposes only the high-level API.
 
 `optimize` returns only a converged backend endpoint. A degenerate objective or
@@ -129,6 +152,15 @@ Open the standard Polyscope panel:
 ```bash
 uv run visualize_mesh_optimization.py
 ```
+
+Run the complete optimization and knitting-graph pipeline:
+
+```bash
+uv run pipeline.py --mesh disk
+```
+
+If a late course cannot be linked, the viewer still opens the successfully
+built partial graph and reports `linking-failed` in its panel.
 
 Animate the recorded feasible iterates:
 

@@ -8,7 +8,6 @@ from boundary_opt import (
     DEFAULT_MINIMUM_GAP,
     DEFAULT_UNIFORMITY_WEIGHT,
     BoundaryOptimizer,
-    load_obj,
     random_knots,
 )
 from boundary_opt.boundary import (
@@ -16,6 +15,7 @@ from boundary_opt.boundary import (
     parameters_from_knots,
 )
 from boundary_opt.loss import DegenerateFieldError
+from geometry import load_obj, normalize_mesh
 
 ROOT = Path(__file__).resolve().parent.parent
 TEST_LENGTH_SMOOTHNESS_WEIGHT = 1.0
@@ -64,6 +64,17 @@ def test_loss_weights_scale_value_and_gradient() -> None:
         weighted_gradient,
         3.0 * uniformity_gradient + 11.0 * length_gradient,
     )
+
+
+def test_mesh_normalization_preserves_objective() -> None:
+    mesh = load_obj(ROOT / "data" / "peak.obj")
+    original = BoundaryOptimizer(mesh)
+    normalized = BoundaryOptimizer(normalize_mesh(mesh, 10.0))
+    knots = random_knots(7)
+    original_loss, original_gradient = original.loss_and_knot_gradient(knots)
+    normalized_loss, normalized_gradient = normalized.loss_and_knot_gradient(knots)
+    assert normalized_loss == pytest.approx(original_loss, abs=1.0e-11)
+    np.testing.assert_allclose(normalized_gradient, original_gradient, atol=1.0e-9)
 
 
 def plane_corner_knots(optimizer: BoundaryOptimizer) -> np.ndarray:
@@ -131,16 +142,36 @@ def test_plane_corners_have_zero_loss() -> None:
     assert optimizer.loss_and_knot_gradient(corners)[0] < 1.0e-8
 
 
+@pytest.mark.parametrize("normalized", [False, True])
 @pytest.mark.parametrize("backend", ["slsqp", "spg"])
-def test_default_length_smoothness_finds_plane_corners(backend: str) -> None:
-    optimizer = BoundaryOptimizer(load_obj(ROOT / "data" / "plane.obj"))
+def test_multistart_uniformity_finds_plane_corners(
+    backend: str, normalized: bool
+) -> None:
+    mesh = load_obj(ROOT / "data" / "plane.obj")
+    optimizer = BoundaryOptimizer(
+        normalize_mesh(mesh, 10.0) if normalized else mesh,
+        uniformity_weight=1.0,
+        length_smoothness_weight=0.0,
+    )
+    initial = random_knots(0)
+    result = optimizer.optimize_multistart(
+        initial, backend=backend, max_iterations=500
+    )
     corners = plane_corner_knots(optimizer)
-    result = optimizer.optimize(random_knots(0), backend=backend, max_iterations=1000)
     distances = np.abs((result.knots % 1.0)[:, None] - corners)
     circular_distances = np.minimum(distances, 1.0 - distances)
-    assert np.max(np.min(circular_distances, axis=0)) < 3.5e-3
-    assert np.max(np.min(circular_distances, axis=1)) < 3.5e-3
-    assert result.length_smoothness_loss < 1.0e-8
+
+    assert result.final_loss < 1.0e-10
+    assert np.max(np.min(circular_distances, axis=0)) < 1.0e-5
+    assert np.max(np.min(circular_distances, axis=1)) < 1.0e-5
+    assert result.history[0] == pytest.approx(result.initial_loss)
+    assert result.history[-1] == pytest.approx(result.final_loss)
+    assert len(result.history) == len(result.parameter_history)
+    np.testing.assert_allclose(result.parameter_history[-1], result.parameters)
+    for parameters, loss in zip(result.parameter_history, result.history):
+        assert optimizer.loss_and_gradient(parameters)[0] == pytest.approx(
+            loss, abs=1.0e-10
+        )
 
 
 def test_global_weight_scale_does_not_change_slsqp_path() -> None:
@@ -174,6 +205,22 @@ def test_high_level_history_and_improvement(
     np.testing.assert_allclose(result.parameter_history[-1], result.parameters)
     assert result.constraint_violation <= 1.0e-9
     assert np.isfinite(result.field).all()
+    np.testing.assert_array_equal(result.field[result.minimum_vertices], 0.0)
+    np.testing.assert_array_equal(result.field[result.maximum_vertices], 1.0)
+    boundary_edges = {
+        tuple(sorted(edge))
+        for edge in zip(
+            disk_optimizer.harmonic.boundary_vertices,
+            np.roll(disk_optimizer.harmonic.boundary_vertices, -1),
+            strict=True,
+        )
+    }
+    for curve in (result.minimum_vertices, result.maximum_vertices):
+        assert len(curve) >= 2
+        assert all(
+            tuple(sorted(edge)) in boundary_edges
+            for edge in zip(curve[:-1], curve[1:], strict=True)
+        )
     for parameters, loss in zip(result.parameter_history, result.history):
         replayed, _ = disk_optimizer.loss_and_gradient(parameters)
         assert replayed == pytest.approx(loss, abs=1.0e-10)
@@ -241,26 +288,30 @@ def test_degenerate_initial_field_raises(backend: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("mesh_name", "maximum_length_smoothness"),
+    ("mesh_name", "maximum_uniformity"),
     [
-        ("disk.obj", 0.05),
-        ("plane.obj", 1.0e-7),
-        ("triple_peak.obj", 2.0),
+        ("disk.obj", 0.03),
+        ("peak.obj", 0.03),
+        ("triple_peak.obj", 0.36),
     ],
 )
 @pytest.mark.parametrize("backend", ["slsqp", "spg"])
-def test_backend_mesh_quality(
+def test_multistart_mesh_quality(
     mesh_name: str,
-    maximum_length_smoothness: float,
+    maximum_uniformity: float,
     backend: str,
 ) -> None:
-    optimizer = BoundaryOptimizer(load_obj(ROOT / "data" / mesh_name))
-    result = optimizer.optimize(random_knots(0), backend=backend, max_iterations=500)
-    assert result.final_loss <= result.initial_loss
-    assert result.final_loss == pytest.approx(
-        optimizer.uniformity_weight * result.uniformity_loss
-        + optimizer.length_smoothness_weight * result.length_smoothness_loss
+    optimizer = BoundaryOptimizer(
+        normalize_mesh(load_obj(ROOT / "data" / mesh_name), 10.0),
+        uniformity_weight=1.0,
+        length_smoothness_weight=0.0,
     )
-    assert result.length_smoothness_loss < maximum_length_smoothness
+    initial = random_knots(0)
+    local = optimizer.optimize(initial, backend=backend, max_iterations=500)
+    result = optimizer.optimize_multistart(
+        initial, backend=backend, max_iterations=500
+    )
+    assert result.final_loss <= local.final_loss
+    assert result.uniformity_loss < maximum_uniformity
     assert result.constraint_violation <= 1.0e-9
     assert np.isfinite(result.field).all()

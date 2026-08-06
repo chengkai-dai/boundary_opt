@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
 
+from geometry import Mesh
+
 from .boundary import (
+    boundary_arclength,
     canonical_knots,
     cyclic_boundary_profile,
     knots_from_parameters,
@@ -20,16 +23,12 @@ from .defaults import (
     DEFAULT_MINIMUM_GAP,
     DEFAULT_UNIFORMITY_WEIGHT,
 )
+from .fem import face_gradient_basis
 from .harmonic import HarmonicField
 from .loss import (
     FieldStatistics,
     length_smoothness_loss_and_gradient,
     uniformity_loss_and_gradient,
-)
-from .mesh import (
-    Mesh,
-    boundary_arclength,
-    face_gradient_basis,
 )
 from .simplex import (
     constraint_violation,
@@ -40,6 +39,7 @@ from .slsqp_backend import minimize_slsqp
 from .spg_backend import minimize_spg
 
 FloatArray = NDArray[np.float64]
+IntArray = NDArray[np.int64]
 BackendName = Literal["slsqp", "spg"]
 
 
@@ -57,6 +57,8 @@ class OptimizationResult:
     knots: FloatArray
     gaps: FloatArray
     field: FloatArray
+    minimum_vertices: IntArray
+    maximum_vertices: IntArray
     statistics: FieldStatistics
     iterations: int
     evaluations: int
@@ -71,8 +73,22 @@ class _Evaluation:
     uniformity_loss: float
     length_smoothness_loss: float
     knot_gradient: FloatArray
+    boundary_values: FloatArray
     field: FloatArray
     statistics: FieldStatistics
+
+
+def _ordered_cyclic_vertices(vertices: IntArray, selected: np.ndarray) -> IntArray:
+    """Preserve the boundary order of one possibly wrapped vertex run."""
+    if not np.any(selected):
+        return np.empty(0, dtype=np.int64)
+    if np.all(selected):
+        return np.asarray(vertices, dtype=np.int64).copy()
+    starts = np.flatnonzero(selected & ~np.roll(selected, 1))
+    if len(starts) != 1:
+        raise RuntimeError("boundary plateau is not one nonempty cyclic run")
+    order = (int(starts[0]) + np.arange(np.count_nonzero(selected))) % len(selected)
+    return np.asarray(vertices[order], dtype=np.int64)
 
 
 class _Objective:
@@ -178,6 +194,7 @@ class BoundaryOptimizer:
             uniformity_loss=uniformity_loss,
             length_smoothness_loss=length_smoothness_loss,
             knot_gradient=knot_gradient,
+            boundary_values=boundary_values,
             field=field,
             statistics=statistics,
         )
@@ -279,6 +296,14 @@ class BoundaryOptimizer:
             knots=canonical_knots(final_knots),
             gaps=final_gaps,
             field=evaluation.field,
+            minimum_vertices=_ordered_cyclic_vertices(
+                self.harmonic.boundary_vertices,
+                evaluation.boundary_values == 0.0,
+            ),
+            maximum_vertices=_ordered_cyclic_vertices(
+                self.harmonic.boundary_vertices,
+                evaluation.boundary_values == 1.0,
+            ),
             statistics=evaluation.statistics,
             iterations=int(solver_result.nit),
             evaluations=objective.evaluations,
@@ -308,3 +333,37 @@ class BoundaryOptimizer:
             )
             for backend in ("slsqp", "spg")
         }
+
+    def optimize_multistart(
+        self,
+        initial_knots: FloatArray,
+        *,
+        backend: BackendName = "slsqp",
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        seed: int | None = None,
+    ) -> OptimizationResult:
+        """Return the best of the input and two balanced physical starts."""
+        initial_parameters = parameters_from_knots(initial_knots, self.minimum_gap)
+        balanced = np.concatenate(([initial_parameters[0]], np.full(4, 0.25)))
+        shifted = balanced.copy()
+        shifted[0] += 0.25
+        starts = [
+            np.asarray(initial_knots, dtype=np.float64).copy(),
+            knots_from_parameters(balanced, self.minimum_gap)[0],
+            knots_from_parameters(shifted, self.minimum_gap)[0],
+        ]
+        runs = [
+            self.optimize(
+                knots,
+                backend=backend,
+                max_iterations=max_iterations,
+                seed=seed,
+            )
+            for knots in starts
+        ]
+        best = min(runs, key=lambda result: result.final_loss)
+        return replace(
+            best,
+            iterations=sum(run.iterations for run in runs),
+            evaluations=sum(run.evaluations for run in runs),
+        )
